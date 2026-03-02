@@ -1,0 +1,533 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+clio-helper - GitHub monitoring daemon for discussions, issues, PRs, and more
+
+=head1 SYNOPSIS
+
+    # Start all monitors (continuous)
+    clio-helper
+
+    # Start specific monitors
+    clio-helper --monitor discussions,issues,prs
+
+    # Run once (single poll cycle)
+    clio-helper --once
+
+    # Dry run (analyze but don't post)
+    clio-helper --dry-run
+
+    # Custom config
+    clio-helper --config /path/to/config.json
+
+    # Debug mode
+    clio-helper --debug
+
+=head1 DESCRIPTION
+
+A daemon that continuously monitors GitHub repositories and uses CLIO AI
+to provide automated assistance:
+
+- **Discussions** - Answer community questions
+- **Issues** - Triage and classify new issues
+- **Pull Requests** - Automated code review
+- **Stale** - Flag/close inactive issues and PRs
+- **Releases** - Generate release notes from commits
+
+=head1 CONFIGURATION
+
+Create ~/.clio/helper-config.json:
+
+    {
+        "repos": [
+            {"owner": "SyntheticAutonomicMind", "repo": "CLIO"},
+            {"owner": "SyntheticAutonomicMind", "repo": ".github"}
+        ],
+        "monitors": {
+            "discussions": true,
+            "issues": true,
+            "pull_requests": true,
+            "stale": true,
+            "releases": true
+        },
+        "poll_interval_seconds": 120,
+        "github_token": "ghp_...",
+        "model": "gpt-5-mini",
+        "dry_run": false,
+        "maintainers": ["fewtarius"]
+    }
+
+Alternatively, set GH_TOKEN or GITHUB_TOKEN environment variables.
+
+=head1 COMMANDS
+
+    clio-helper                     Start all enabled monitors
+    clio-helper --monitor TYPE      Start specific monitor(s)
+    clio-helper --once              Run single poll cycle
+    clio-helper --stats             Show statistics
+    clio-helper --version           Show version
+    clio-helper --help              Show this help
+
+=cut
+
+use strict;
+use warnings;
+use utf8;
+
+binmode(STDOUT, ':encoding(UTF-8)');
+binmode(STDERR, ':encoding(UTF-8)');
+
+use FindBin;
+use lib "$FindBin::Bin/lib";
+
+use Getopt::Long;
+use Pod::Usage;
+use JSON::PP qw(decode_json);
+use POSIX qw(strftime);
+
+our $VERSION = '2.0.0';
+
+my %opts = (
+    config  => '',
+    debug   => 0,
+    once    => 0,
+    dry_run => 0,
+    stats   => 0,
+    help    => 0,
+    version => 0,
+    monitor => '',
+);
+
+GetOptions(
+    'config=s'  => \$opts{config},
+    'debug'     => \$opts{debug},
+    'once'      => \$opts{once},
+    'dry-run'   => \$opts{dry_run},
+    'monitor=s' => \$opts{monitor},
+    'stats'     => \$opts{stats},
+    'help|h'    => \$opts{help},
+    'version|v' => \$opts{version},
+) or pod2usage(2);
+
+pod2usage(-verbose => 2) if $opts{help};
+
+if ($opts{version}) {
+    print "clio-helper version $VERSION\n";
+    exit 0;
+}
+
+$ENV{CLIO_LOG_LEVEL} = 'DEBUG' if $opts{debug};
+
+# Find config file
+my $config_file = $opts{config};
+unless ($config_file) {
+    # Try new name first, then legacy
+    for my $name ('helper-config.json', 'discuss-config.json') {
+        my $path = "$ENV{HOME}/.clio/$name";
+        if (-f $path) {
+            $config_file = $path;
+            last;
+        }
+    }
+    $config_file ||= "$ENV{HOME}/.clio/helper-config.json";
+}
+
+# Load configuration
+my $config = _load_config($config_file);
+
+# Apply command-line overrides
+$config->{dry_run} = 1 if $opts{dry_run};
+$config->{debug}   = 1 if $opts{debug};
+
+# Determine which monitors to run
+my %enabled_monitors = _resolve_monitors($config, $opts{monitor});
+
+# Initialize state database
+require CLIO::Daemon::State;
+my $state = CLIO::Daemon::State->new(
+    db_file => $config->{state_file} || "$ENV{HOME}/.clio/helper-state.db",
+    debug   => $opts{debug},
+);
+
+# Show stats and exit
+if ($opts{stats}) {
+    _show_stats($state, \%enabled_monitors);
+    exit 0;
+}
+
+# Create monitor instances
+my %monitors;
+
+if ($enabled_monitors{discussions}) {
+    require CLIO::Daemon::DiscussionMonitor;
+    # DiscussionMonitor has its own config loading
+    $monitors{discussions} = CLIO::Daemon::DiscussionMonitor->new(
+        config_file => $config_file,
+        debug       => $opts{debug},
+    );
+    $monitors{discussions}{config}{dry_run} = 1 if $config->{dry_run};
+}
+
+if ($enabled_monitors{issues}) {
+    require CLIO::Daemon::IssueMonitor;
+    $monitors{issues} = CLIO::Daemon::IssueMonitor->new(
+        config => $config,
+        state  => $state,
+        debug  => $opts{debug},
+    );
+}
+
+if ($enabled_monitors{pull_requests}) {
+    require CLIO::Daemon::PRMonitor;
+    $monitors{pull_requests} = CLIO::Daemon::PRMonitor->new(
+        config => $config,
+        state  => $state,
+        debug  => $opts{debug},
+    );
+}
+
+if ($enabled_monitors{stale}) {
+    require CLIO::Daemon::StaleMonitor;
+    $monitors{stale} = CLIO::Daemon::StaleMonitor->new(
+        config => $config,
+        state  => $state,
+        debug  => $opts{debug},
+    );
+}
+
+if ($enabled_monitors{releases}) {
+    require CLIO::Daemon::ReleaseMonitor;
+    $monitors{releases} = CLIO::Daemon::ReleaseMonitor->new(
+        config => $config,
+        state  => $state,
+        debug  => $opts{debug},
+    );
+}
+
+unless (keys %monitors) {
+    print STDERR "No monitors enabled. Check config or use --monitor.\n";
+    exit 1;
+}
+
+# Run
+if ($opts{once}) {
+    _run_once(\%monitors);
+} else {
+    _run_daemon($config, \%monitors);
+}
+
+# --- Subroutines ---
+
+sub _load_config {
+    my ($file) = @_;
+    $file =~ s/^~/$ENV{HOME}/;
+    
+    my $config = {};
+    
+    if (-f $file) {
+        open my $fh, '<:encoding(UTF-8)', $file or die "Cannot read $file: $!\n";
+        my $content = do { local $/; <$fh> };
+        close $fh;
+        
+        eval { $config = decode_json($content); };
+        die "Invalid JSON in $file: $@\n" if $@;
+    } else {
+        _log("WARN", "Config file not found: $file, using defaults");
+    }
+    
+    # Apply defaults
+    $config->{repos}                    //= [{ owner => 'SyntheticAutonomicMind', repo => '.github' }];
+    $config->{monitors}                 //= {};
+    $config->{monitors}{discussions}    //= 1;
+    $config->{monitors}{issues}         //= 1;
+    $config->{monitors}{pull_requests}  //= 1;
+    $config->{monitors}{stale}          //= 0;
+    $config->{monitors}{releases}       //= 0;
+    $config->{poll_interval_seconds}    //= 120;
+    $config->{github_token}             //= $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '';
+    $config->{posting_token}            //= $ENV{CLIO_POSTING_TOKEN} || '';
+    $config->{model}                    //= 'gpt-5-mini';
+    $config->{dry_run}                  //= 0;
+    $config->{maintainers}              //= ['fewtarius'];
+    $config->{state_file}               //= "$ENV{HOME}/.clio/helper-state.db";
+    $config->{log_file}                 //= "$ENV{HOME}/.clio/helper-daemon.log";
+    $config->{clio_path}                //= 'clio';
+    $config->{repos_dir}                //= "$ENV{HOME}/.clio/repos";
+    $config->{prompts_dir}              //= '';
+    
+    # Issue-specific defaults
+    $config->{issue_cooldown_minutes}   //= 60;
+    $config->{issue_poll_limit}         //= 10;
+    
+    # PR-specific defaults
+    $config->{pr_cooldown_minutes}      //= 30;
+    $config->{pr_poll_limit}            //= 10;
+    $config->{max_diff_size}            //= 50000;
+    
+    # Stale-specific defaults
+    $config->{stale_warning_days}       //= 30;
+    $config->{stale_close_days}         //= 60;
+    $config->{stale_pr_warning_days}    //= 14;
+    
+    return $config;
+}
+
+sub _resolve_monitors {
+    my ($config, $monitor_opt) = @_;
+    
+    my %enabled;
+    
+    if ($monitor_opt) {
+        # CLI override: only run specified monitors
+        for my $m (split /,/, $monitor_opt) {
+            $m =~ s/^\s+|\s+$//g;
+            $m = 'pull_requests' if $m eq 'prs' || $m eq 'pr';
+            $enabled{$m} = 1;
+        }
+    } else {
+        # Use config
+        for my $m (keys %{$config->{monitors} || {}}) {
+            $enabled{$m} = 1 if $config->{monitors}{$m};
+        }
+    }
+    
+    return %enabled;
+}
+
+sub _run_once {
+    my ($monitors) = @_;
+    
+    _log("INFO", "Running single poll cycle");
+    
+    for my $name (sort keys %$monitors) {
+        _log("INFO", "Polling: $name");
+        eval {
+            if ($name eq 'discussions') {
+                $monitors->{$name}->run_once();
+            } else {
+                $monitors->{$name}->poll_cycle();
+            }
+        };
+        if ($@) {
+            _log("ERROR", "$name poll failed: $@");
+        }
+    }
+    
+    _log("INFO", "Poll cycle complete");
+}
+
+sub _run_daemon {
+    my ($config, $monitors) = @_;
+    
+    my $running = 1;
+    local $SIG{INT}  = sub { _log("INFO", "Received SIGINT, shutting down..."); $running = 0; };
+    local $SIG{TERM} = sub { _log("INFO", "Received SIGTERM, shutting down..."); $running = 0; };
+    
+    my $interval = $config->{poll_interval_seconds} || 120;
+    my @monitor_names = sort keys %$monitors;
+    
+    print "=== CLIO Helper Daemon v$VERSION ===\n";
+    print "Monitors: " . join(', ', @monitor_names) . "\n";
+    print "Repos: " . join(', ', map { "$_->{owner}/$_->{repo}" } @{$config->{repos}}) . "\n";
+    print "Poll interval: ${interval}s\n";
+    print "Dry run: " . ($config->{dry_run} ? "yes" : "no") . "\n";
+    print "Press Ctrl+C to stop\n\n";
+    
+    # Stale and releases don't need to run every cycle
+    my $stale_interval    = ($config->{stale_check_hours}   || 6) * 3600;
+    my $release_interval  = ($config->{release_check_hours} || 1) * 3600;
+    my $last_stale_check  = 0;
+    my $last_release_check = 0;
+    
+    while ($running) {
+        my $start = time();
+        
+        for my $name (@monitor_names) {
+            last unless $running;
+            
+            # Stale/release monitors run less frequently
+            if ($name eq 'stale') {
+                next if ($start - $last_stale_check) < $stale_interval;
+                $last_stale_check = $start;
+            }
+            if ($name eq 'releases') {
+                next if ($start - $last_release_check) < $release_interval;
+                $last_release_check = $start;
+            }
+            
+            eval {
+                if ($name eq 'discussions') {
+                    $monitors->{$name}->run_once();
+                } else {
+                    $monitors->{$name}->poll_cycle();
+                }
+            };
+            if ($@) {
+                _log("ERROR", "$name poll failed: $@");
+            }
+        }
+        
+        # Sleep until next cycle
+        my $elapsed = time() - $start;
+        my $sleep_time = $interval - $elapsed;
+        
+        if ($sleep_time > 0 && $running) {
+            _log("DEBUG", "Sleeping ${sleep_time}s until next cycle");
+            # Sleep in 1-second intervals so we can respond to signals
+            for (1 .. int($sleep_time)) {
+                last unless $running;
+                sleep 1;
+            }
+        }
+    }
+    
+    _log("INFO", "Daemon stopped");
+}
+
+sub _show_stats {
+    my ($state, $enabled) = @_;
+    
+    print "=== CLIO Helper Statistics ===\n\n";
+    print "Enabled monitors: " . join(', ', sort grep { $enabled->{$_} } keys %$enabled) . "\n\n";
+    
+    # Use state database for stats
+    eval {
+        my $stats = $state->get_stats();
+        
+        print "-- Overall --\n";
+        print "Items checked:    $stats->{total_discussions_checked}\n";
+        print "Responses posted: $stats->{total_responses_posted}\n";
+        print "Unique users:     $stats->{unique_users_helped}\n";
+        
+        print "\n-- Last 24 Hours --\n";
+        print "Responses: $stats->{responses_last_24h}\n";
+        
+        print "\n-- Errors --\n";
+        print "Last hour: $stats->{errors_last_hour}\n";
+        print "Last 24h:  $stats->{errors_last_24h}\n";
+    };
+    if ($@) {
+        print "Could not load stats: $@\n";
+    }
+}
+
+sub _log {
+    my ($level, $msg) = @_;
+    return if $level eq 'DEBUG' && !$opts{debug};
+    my $ts = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    print STDERR "[$ts][$level][clio-helper] $msg\n";
+}
+
+__END__
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--config FILE>
+
+Path to configuration file (default: ~/.clio/helper-config.json)
+
+=item B<--monitor TYPES>
+
+Comma-separated list of monitors to run:
+discussions, issues, prs, stale, releases
+
+=item B<--debug>
+
+Enable debug logging
+
+=item B<--once>
+
+Run a single poll cycle and exit
+
+=item B<--dry-run>
+
+Analyze but don't post responses or modify issues
+
+=item B<--stats>
+
+Show statistics and exit
+
+=item B<--version>
+
+Show version number and exit
+
+=item B<--help>
+
+Show this help message
+
+=back
+
+=head1 MONITORS
+
+=over 4
+
+=item B<discussions>
+
+Monitor GitHub Discussions for questions and provide AI-powered answers.
+
+=item B<issues>
+
+Triage new GitHub Issues: classify, prioritize, label, and assign.
+
+=item B<pull_requests> (prs)
+
+Review pull requests: analyze code changes, check style, flag security issues.
+
+=item B<stale>
+
+Detect stale issues/PRs and post warnings or close after inactivity.
+
+=item B<releases>
+
+Generate release notes from commit messages for new GitHub releases.
+
+=back
+
+=head1 ENVIRONMENT
+
+=over 4
+
+=item B<GH_TOKEN> or B<GITHUB_TOKEN>
+
+GitHub personal access token
+
+=item B<CLIO_POSTING_TOKEN>
+
+Separate token for posting comments (optional, uses GH_TOKEN if not set)
+
+=item B<CLIO_LOG_LEVEL>
+
+Set to DEBUG for verbose logging
+
+=back
+
+=head1 FILES
+
+=over 4
+
+=item F<~/.clio/helper-config.json>
+
+Main configuration file
+
+=item F<~/.clio/helper-state.db>
+
+SQLite database for state tracking
+
+=item F<~/.clio/helper-daemon.log>
+
+Daemon log file
+
+=back
+
+=head1 AUTHOR
+
+CLIO Project
+
+=head1 LICENSE
+
+GPL-3.0
+
+=cut

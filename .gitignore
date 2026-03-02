@@ -1,0 +1,33 @@
+# CLIO workspace
+.clio/*
+!.clio/instructions.md
+
+# State database
+discuss-state.db
+
+# Config with secrets
+discuss-config.json
+
+# Handoff files (never commit)
+ai-assisted/
+
+# Scratch workspace
+scratch/
+
+# Logs and temp
+*.log
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

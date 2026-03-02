@@ -1,0 +1,45 @@
+{
+    "repos": [
+        {"owner": "SyntheticAutonomicMind", "repo": "CLIO"},
+        {"owner": "SyntheticAutonomicMind", "repo": "SAM"},
+        {"owner": "SyntheticAutonomicMind", "repo": "ALICE"}
+    ],
+    "monitors": {
+        "discussions": true,
+        "issues": true,
+        "pull_requests": true,
+        "stale": false,
+        "releases": false
+    },
+    "poll_interval_seconds": 120,
+    "github_token": "",
+    "posting_token": "",
+    "model": "gpt-5-mini",
+    "clio_path": "clio",
+    "dry_run": false,
+    "maintainers": ["fewtarius"],
+
+    "log_file": "~/.clio/helper-daemon.log",
+    "state_file": "~/.clio/helper-state.db",
+    "alert_file": "~/.clio/helper-alerts.log",
+    "repos_dir": "~/.clio/repos",
+    "prompts_dir": "",
+    "auto_pull": true,
+
+    "max_response_age_hours": 24,
+    "response_cooldown_minutes": 30,
+    "max_responses_per_discussion": 3,
+    "user_rate_limit_per_hour": 5,
+    "user_rate_limit_per_day": 15,
+
+    "issue_cooldown_minutes": 60,
+    "issue_poll_limit": 10,
+
+    "pr_cooldown_minutes": 30,
+    "pr_poll_limit": 10,
+    "max_diff_size": 50000,
+
+    "stale_warning_days": 30,
+    "stale_close_days": 60,
+    "stale_pr_warning_days": 14
+}
