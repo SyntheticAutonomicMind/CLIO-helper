@@ -172,6 +172,9 @@ sub _poll_repo {
             next;
         }
         
+        # Claim this issue before starting (prevents double-post if cycles overlap)
+        $self->{state}->record_check($issue_id, 'processing');
+
         # Triage this issue
         eval {
             $self->_triage_issue($owner, $name, $issue);
@@ -221,19 +224,38 @@ sub _fetch_issues {
 
 =head2 _has_triage_labels
 
-Check if an issue already has classification labels.
+Check if an issue has already been triaged by CLIO-helper.
+
+Only CLIO-applied labels indicate prior triage - specifically:
+  priority:critical, priority:high, priority:medium, priority:low,
+  triaged, clio-reviewed, needs-info
+
+GitHub default labels (bug, enhancement, question, etc.) are NOT
+triage indicators - users apply those when filing issues and should
+not cause CLIO to skip triage.
 
 =cut
 
 sub _has_triage_labels {
     my ($self, $issue) = @_;
     
-    my @triage_labels = qw(bug feature enhancement question documentation invalid needs-review);
-    my %triage_set = map { $_ => 1 } @triage_labels;
+    # Only skip if CLIO-helper has already processed this issue.
+    # GitHub default labels (bug, enhancement, question, etc.) are NOT
+    # triage indicators - they are applied by users at filing time.
+    my @clio_triage_labels = (
+        "priority:critical",
+        "priority:high",
+        "priority:medium",
+        "priority:low",
+        "triaged",
+        "clio-reviewed",
+        "needs-info",
+    );
+    my %clio_set = map { $_ => 1 } @clio_triage_labels;
     
     for my $label (@{$issue->{labels} || []}) {
         my $name = ref($label) ? $label->{name} : $label;
-        return 1 if $triage_set{$name};
+        return 1 if $clio_set{$name};
     }
     
     return 0;

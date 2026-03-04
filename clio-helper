@@ -51,7 +51,7 @@ Create ~/.clio/helper-config.json:
             "stale": true,
             "releases": true
         },
-        "poll_interval_seconds": 120,
+        "poll_interval_seconds": 300,
         "github_token": "ghp_...",
         "model": "gpt-5-mini",
         "dry_run": false,
@@ -85,6 +85,7 @@ use Getopt::Long;
 use Pod::Usage;
 use JSON::PP qw(decode_json);
 use POSIX qw(strftime);
+use Fcntl qw(:flock);
 
 our $VERSION = '2.0.0';
 
@@ -210,6 +211,20 @@ unless (keys %monitors) {
     exit 1;
 }
 
+# Acquire exclusive lock in daemon mode to prevent overlapping instances.
+# --once skips the lock (manual single-shot runs are fine to overlap).
+my $lock_fh;
+unless ($opts{once}) {
+    my $lock_file = $config->{lock_file} || "$ENV{HOME}/.clio/helper.lock";
+    open($lock_fh, '>', $lock_file) or die "Cannot open lock file $lock_file: $!\n";
+    _log("DEBUG", "Waiting for lock: $lock_file");
+    flock($lock_fh, LOCK_EX) or die "Cannot acquire lock: $!\n";  # blocking exclusive lock
+    _log("DEBUG", "Lock acquired");
+    # Write PID for diagnostics
+    truncate($lock_fh, 0);
+    print $lock_fh "$$\n";
+}
+
 # Run
 if ($opts{once}) {
     _run_once(\%monitors);
@@ -244,7 +259,7 @@ sub _load_config {
     $config->{monitors}{pull_requests}  //= 1;
     $config->{monitors}{stale}          //= 0;
     $config->{monitors}{releases}       //= 0;
-    $config->{poll_interval_seconds}    //= 120;
+    $config->{poll_interval_seconds}    //= 300;
     $config->{github_token}             //= $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '';
     $config->{posting_token}            //= $ENV{CLIO_POSTING_TOKEN} || '';
     $config->{model}                    //= 'gpt-5-mini';
@@ -252,6 +267,7 @@ sub _load_config {
     $config->{maintainers}              //= ['fewtarius'];
     $config->{state_file}               //= "$ENV{HOME}/.clio/helper-state.db";
     $config->{log_file}                 //= "$ENV{HOME}/.clio/helper-daemon.log";
+    $config->{lock_file}                //= "$ENV{HOME}/.clio/helper.lock";
     $config->{clio_path}                //= 'clio';
     $config->{repos_dir}                //= "$ENV{HOME}/.clio/repos";
     $config->{prompts_dir}              //= '';
@@ -324,7 +340,7 @@ sub _run_daemon {
     local $SIG{INT}  = sub { _log("INFO", "Received SIGINT, shutting down..."); $running = 0; };
     local $SIG{TERM} = sub { _log("INFO", "Received SIGTERM, shutting down..."); $running = 0; };
     
-    my $interval = $config->{poll_interval_seconds} || 120;
+    my $interval = $config->{poll_interval_seconds} || 300;
     my @monitor_names = sort keys %$monitors;
     
     print "=== CLIO Helper Daemon v$VERSION ===\n";
