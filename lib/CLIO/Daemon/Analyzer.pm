@@ -101,15 +101,34 @@ sub analyze {
 =head2 _build_prompt
 
 Build the analysis prompt for CLIO.
+Dispatches to context-specific builders based on type.
 
 =cut
 
 sub _build_prompt {
     my ($self, $context) = @_;
-    
+
+    my $type = $context->{type} || 'discussion';
+
+    if ($type eq 'pull_request') {
+        return $self->_build_pr_prompt($context);
+    }
+
+    return $self->_build_discussion_prompt($context);
+}
+
+=head2 _build_discussion_prompt
+
+Build analysis prompt for discussion context.
+
+=cut
+
+sub _build_discussion_prompt {
+    my ($self, $context) = @_;
+
     my $disc = $context->{discussion};
     my @comments = @{$context->{comments} || []};
-    
+
     # Build conversation thread
     my $thread = "## Discussion Thread\n\n";
     $thread .= "**Repository:** $context->{repo}\n";
@@ -119,7 +138,7 @@ sub _build_prompt {
     $thread .= "**URL:** $disc->{url}\n\n";
     $thread .= "### Original Post\n\n";
     $thread .= $disc->{body} . "\n\n";
-    
+
     if (@comments) {
         $thread .= "### Comments\n\n";
         for my $c (@comments) {
@@ -127,25 +146,78 @@ sub _build_prompt {
             $thread .= $c->{body} . "\n\n";
         }
     }
-    
-    # Sanitize invisible characters from user-supplied content before
-    # including it in the prompt.  This is a defense-in-depth layer:
-    # Guardrails.pm flags/blocks the most dangerous cases, but we also
-    # strip the characters here so that anything which reaches the AI has
-    # had its invisible payload removed.
+
     $thread = $self->_strip_invisible_chars($thread);
-    
-    # Try to load prompt from external file first
+
     my $prompt = $self->_load_prompt_file();
-    
-    # Fall back to built-in prompt if no file found
     unless ($prompt) {
         $prompt = $self->_default_prompt();
     }
-    
-    # Append the conversation thread
+
     $prompt .= "\n---\n\n## Conversation to Analyze\n\n$thread\n";
-    
+
+    return $prompt;
+}
+
+=head2 _build_pr_prompt
+
+Build analysis prompt for pull request review context.
+Includes diff, changed files, and branch metadata.
+
+=cut
+
+sub _build_pr_prompt {
+    my ($self, $context) = @_;
+
+    my $disc = $context->{discussion};
+    my @comments = @{$context->{comments} || []};
+
+    # Load the PR review prompt template
+    my $prompt = $self->_load_prompt_file();
+    unless ($prompt) {
+        $prompt = $self->_default_prompt();
+    }
+
+    # Build the PR context section
+    my $pr_context = "## Pull Request to Review\n\n";
+    $pr_context .= "**Repository:** $context->{repo}\n";
+    $pr_context .= "**PR #$disc->{number}:** $disc->{title}\n";
+    $pr_context .= "**Author:** \@$disc->{author}\n";
+    $pr_context .= "**URL:** $disc->{url}\n";
+    $pr_context .= "**Base:** `$disc->{base}` <- **Head:** `$disc->{head}`\n";
+    $pr_context .= "**Head SHA:** `$disc->{head_sha}`\n\n";
+
+    # PR description
+    $pr_context .= "### Description\n\n";
+    $pr_context .= ($disc->{body} || '(No description provided)') . "\n\n";
+
+    # Changed files summary
+    if ($disc->{files}) {
+        $pr_context .= "### Changed Files\n\n";
+        $pr_context .= $disc->{files} . "\n";
+    }
+
+    # Full diff
+    if ($disc->{diff}) {
+        $pr_context .= "### Diff\n\n";
+        $pr_context .= "```diff\n";
+        $pr_context .= $disc->{diff};
+        $pr_context .= "```\n\n";
+    }
+
+    # Existing review comments
+    if (@comments) {
+        $pr_context .= "### Existing Comments\n\n";
+        for my $c (@comments) {
+            $pr_context .= "**\@$c->{author}** ($c->{created}):\n";
+            $pr_context .= $c->{body} . "\n\n";
+        }
+    }
+
+    $pr_context = $self->_strip_invisible_chars($pr_context);
+
+    $prompt .= "\n---\n\n$pr_context\n";
+
     return $prompt;
 }
 
