@@ -140,6 +140,7 @@ For each changed file, evaluate:
 - **Edge cases**: What happens with empty input, null values, very large data, concurrent access?
 - **Error handling**: Are errors caught and handled appropriately? Are error messages useful?
 - **Return values**: Are all return paths correct? Are callers handling all possible returns?
+- **Resource cleanup**: If the code changes directory (chdir), opens files, or acquires locks inside an eval block, are these cleaned up when exceptions occur? A common bug: `chdir` inside eval without a finally/guard means the process CWD stays changed on exception.
 
 #### Naming and Clarity
 - **Variable names**: Do they clearly describe what they hold?
@@ -207,6 +208,8 @@ If ANY of these patterns are detected, set `recommendation: "security-concern"` 
 
 **Error messages showing file paths** are NORMAL for CLI tools. Don't flag these as security concerns.
 
+**Pre-existing patterns rule:** If the SAME pattern (e.g., backtick shell calls) exists in 5+ existing methods in the same file, and the PR adds one more method following that pattern, list it as a SINGLE note: "Pre-existing: all methods in this module use backtick shell calls. Consider migrating to system LIST form as a follow-up." Do NOT list it as a separate finding for each method or each file. One note covers the whole pattern.
+
 ### Step 6: Return Your Review
 
 Return your review as JSON. Choose your recommendation carefully:
@@ -247,6 +250,29 @@ Return your review as JSON:
   "detailed_feedback": ["High-level suggestions for the PR as a whole"]
 }
 ```
+
+### Summary Format
+
+**The summary MUST follow this structure:**
+
+1. **Lead with positives** - What the PR does well: feature value, code quality, test coverage, pattern adherence
+2. **Then state blockers** (if any) - Only issues that MUST be fixed before merge
+3. **Then mention improvements** - Things that would be nice but aren't blockers
+
+**Example good summary:**
+> "Good feature addition with comprehensive tests (46 unit tests) and proper locking/sandbox integration. Two issues need fixing before merge: encoding corruption in VersionControl.pm POD, and a duplicate hash key in get_additional_parameters(). Several style improvements are suggested but not blocking."
+
+**Example bad summary:**
+> "Several security concerns and style issues found. Encoding corruption, shell injection risks, and insufficient test coverage."
+
+The good summary is balanced, specific, and distinguishes blockers from suggestions. The bad summary is negative-first and vague.
+
+### Distinguishing Blockers from Suggestions
+
+In your `detailed_feedback`, clearly separate:
+- **Must fix** (before merge): Actual bugs, encoding corruption, broken functionality
+- **Should fix** (before or after merge): Style improvements, defensive coding
+- **Pre-existing patterns** (follow-up PR): Issues that exist in the codebase already, not introduced by this PR
 
 ### `file_comments` Guidance
 
