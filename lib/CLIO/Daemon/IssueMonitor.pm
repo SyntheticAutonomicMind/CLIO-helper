@@ -58,6 +58,16 @@ sub new {
     
     bless $self, $class;
     
+    # Auto-detect bot_username if not configured
+    unless ($self->{config}{bot_username}) {
+        my $gh_user = `gh api user --jq '.login' 2>/dev/null`;
+        if ($gh_user && $? == 0) {
+            chomp $gh_user;
+            $self->{config}{bot_username} = $gh_user;
+            $self->_log("DEBUG", "Auto-detected bot_username: $gh_user");
+        }
+    }
+    
     $self->_init_analyzer();
     
     return $self;
@@ -169,6 +179,13 @@ sub _poll_repo {
         if ($issue->{user} && $issue->{user}{type} eq 'Bot') {
             $self->_log("DEBUG", "Skipping issue #$issue->{number} (created by bot)");
             $self->{state}->record_check($issue_id, 'skip-bot');
+            next;
+        }
+        
+        # Skip if last comment is from CLIO/bot (don't respond twice)
+        if ($self->_last_comment_is_from_bot($owner, $name, $issue->{number})) {
+            $self->_log("DEBUG", "Skipping issue #$issue->{number} (last comment from bot)");
+            $self->{state}->record_check($issue_id, 'skip-bot-replied');
             next;
         }
         
@@ -384,6 +401,48 @@ sub _fetch_issue_comments {
     }
     
     return \@comments;
+}
+
+=head2 _last_comment_is_from_bot
+
+Check if the most recent comment on an issue is from CLIO/bot or a maintainer.
+
+Returns 1 if the last commenter is the bot or a maintainer, 0 otherwise.
+
+=cut
+
+sub _last_comment_is_from_bot {
+    my ($self, $owner, $name, $number) = @_;
+    
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+    
+    # Fetch only the latest comment (gh api returns newest first)
+    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?per_page=1" 2>/dev/null};
+    my $response = `$cmd`;
+    return 0 if $? != 0;
+    
+    my $data;
+    eval { $data = decode_json($response); };
+    return 0 if $@ || ref($data) ne 'ARRAY';
+    return 0 unless @$data;
+    
+    my $last_author = $data->[0]->{user}{login} || '';
+    my $maintainers = $self->{config}{maintainers} || [];
+    
+    # Check if last commenter is a maintainer (skip if maintainer replied)
+    if (grep { $_ eq $last_author } @$maintainers) {
+        $self->_log("DEBUG", "Last comment on $owner/$name#$number is from maintainer $last_author, skipping");
+        return 1;
+    }
+    
+    # Check if last commenter is a bot
+    my $bot_user = $self->{config}{bot_username} || '';
+    return 1 if $last_author =~ /clio/i;
+    return 1 if $last_author =~ /\[bot\]$/;
+    return 1 if $last_author eq 'github-actions';
+    return 1 if $bot_user && $last_author eq $bot_user;
+    
+    return 0;
 }
 
 =head2 _fetch_issue_events
