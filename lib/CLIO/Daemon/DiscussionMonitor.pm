@@ -125,7 +125,17 @@ sub _load_config {
     for my $key (keys %$defaults) {
         $self->{config}{$key} //= $defaults->{$key};
     }
-    
+
+    # Auto-detect bot_username if not configured
+    unless ($self->{config}{bot_username}) {
+        my $gh_user = `gh api user --jq '.login' 2>/dev/null`;
+        if ($gh_user && $? == 0) {
+            chomp $gh_user;
+            $self->{config}{bot_username} = $gh_user;
+            $self->_log("DEBUG", "Auto-detected bot_username: $gh_user");
+        }
+    }
+
     $self->_log("DEBUG", "Loaded config from $config_file");
 }
 
@@ -136,19 +146,20 @@ Return default configuration values.
 =cut
 
 sub _default_config {
-    return {
-        repos => [
-            { owner => 'SyntheticAutonomicMind', repo => '.github' },
-        ],
-        poll_interval_seconds => 120,  # 2 minutes
-        github_token => $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
-        posting_token => $ENV{CLIO_POSTING_TOKEN} || '',  # Separate token for posting comments (optional)
-        model => 'gpt-5-mini',
-        dry_run => 0,
-        maintainers => ['fewtarius'],
-        log_file => "$ENV{HOME}/.clio/discuss-daemon.log",
-        alert_file => "$ENV{HOME}/.clio/discuss-alerts.log",  # Maintainer alert log
-        state_file => "$ENV{HOME}/.clio/discuss-state.db",
+   return {
+       repos => [
+           { owner => 'SyntheticAutonomicMind', repo => '.github' },
+       ],
+       poll_interval_seconds => 120,  # 2 minutes
+       github_token => $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
+       posting_token => $ENV{CLIO_POSTING_TOKEN} || '',  # Separate token for posting comments (optional)
+       model => 'gpt-5-mini',
+       dry_run => 0,
+       maintainers => ['fewtarius'],
+       bot_username => '',  # Bot's GitHub username (auto-detected if empty)
+       log_file => "$ENV{HOME}/.clio/discuss-daemon.log",
+       alert_file => "$ENV{HOME}/.clio/discuss-alerts.log",  # Maintainer alert log
+       state_file => "$ENV{HOME}/.clio/discuss-state.db",
         repos_dir => "$ENV{HOME}/.clio/repos",  # Directory for cloned repos
         prompts_dir => '',  # Directory for prompt templates (defaults to bundled prompts)
         notify_in_thread => 0,  # Whether to @mention maintainers in flagged threads
@@ -542,6 +553,17 @@ Check if there are new comments or replies from users since a given timestamp.
 
 sub _has_new_activity {
     my ($self, $disc, $since_ts) = @_;
+    my $bot_user = $self->{config}{bot_username} || '';
+    
+    # Helper to check if author is a bot
+    my $is_bot = sub {
+        my ($author) = @_;
+        return 1 if $author =~ /clio/i;
+        return 1 if $author =~ /\[bot\]$/;
+        return 1 if $author eq 'github-actions';
+        return 1 if $bot_user && $author eq $bot_user;
+        return 0;
+    };
     
     for my $comment (@{$disc->{comments}{nodes} || []}) {
         # Check the comment itself
@@ -549,7 +571,7 @@ sub _has_new_activity {
         if ($comment_ts > $since_ts) {
             my $comment_author = $comment->{author}{login} || '';
             # New comment from a user (not CLIO or bot)
-            unless ($comment_author =~ /clio/i || $comment_author =~ /\[bot\]$/) {
+            unless ($is_bot->($comment_author)) {
                 return 1;
             }
         }
@@ -560,7 +582,7 @@ sub _has_new_activity {
             if ($reply_ts > $since_ts) {
                 my $reply_author = $reply->{author}{login} || '';
                 # New reply from a user (not CLIO or bot)
-                unless ($reply_author =~ /clio/i || $reply_author =~ /\[bot\]$/) {
+                unless ($is_bot->($reply_author)) {
                     return 1;
                 }
             }
@@ -632,7 +654,11 @@ sub _needs_response {
     my $last_body = $last_activity->{body};
     
     # If last activity is from CLIO/bot, skip
-    return undef if $last_author =~ /clio/i || $last_author =~ /\[bot\]$/ || $last_author eq 'github-actions';
+    my $bot_user = $self->{config}{bot_username} || '';
+    return undef if $last_author =~ /clio/i 
+        || $last_author =~ /\[bot\]$/ 
+        || $last_author eq 'github-actions'
+        || ($bot_user && $last_author eq $bot_user);
     
     # If last activity is from maintainer, skip (let them handle it)
     if (grep { $_ eq $last_author } @$maintainers) {
