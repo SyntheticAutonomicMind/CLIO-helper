@@ -286,6 +286,11 @@ sub _load_config {
     $config->{stale_close_days}         //= 60;
     $config->{stale_pr_warning_days}    //= 14;
     
+    # CLIO auto-update defaults
+    $config->{auto_update_clio}         //= 1;
+    $config->{update_check_hours}       //= 4;
+    $config->{helper_install_dir}       //= "$ENV{HOME}/CLIO-helper";
+    
     return $config;
 }
 
@@ -356,8 +361,22 @@ sub _run_daemon {
     my $last_stale_check  = 0;
     my $last_release_check = 0;
     
+    # CLIO auto-update check
+    my $update_interval = ($config->{update_check_hours} || 4) * 3600;
+    my $last_update_check = 0;
+    
     while ($running) {
         my $start = time();
+        
+        # Check for CLIO updates at configured interval
+        if ($config->{auto_update_clio} && ($start - $last_update_check) >= $update_interval) {
+            _log("DEBUG", "Checking for CLIO updates...");
+            my ($updated, $message) = _check_clio_update($config, $state, $opts{debug});
+            if ($updated) {
+                _log("INFO", "CLIO update: $message");
+            }
+            $last_update_check = $start;
+        }
         
         for my $name (@monitor_names) {
             last unless $running;
@@ -426,6 +445,26 @@ sub _show_stats {
     if ($@) {
         print "Could not load stats: $@\n";
     }
+}
+
+sub _check_clio_update {
+    my ($config, $state, $debug) = @_;
+    
+    # Check if enough time has passed since last check
+    my $update_interval = ($config->{update_check_hours} || 4) * 3600;
+    unless ($state->should_check_for_updates($update_interval)) {
+        return (0, "Checked recently, skipping");
+    }
+    
+    require CLIO::Daemon::UpdateChecker;
+    
+    my $checker = CLIO::Daemon::UpdateChecker->new(
+        config => $config,
+        state  => $state,
+        debug  => $debug,
+    );
+    
+    return $checker->check_and_update();
 }
 
 sub _log {

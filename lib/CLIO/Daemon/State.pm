@@ -168,9 +168,27 @@ sub _init_db {
         ON error_log(occurred_at)
     });
     
+    # CLIO update tracking table
+    $self->{dbh}->do(q{
+        CREATE TABLE IF NOT EXISTS clio_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            check_time INTEGER NOT NULL,
+            current_version TEXT,
+            latest_version TEXT,
+            update_status TEXT,
+            error_message TEXT,
+            updated_version TEXT
+        )
+    });
+    
+    $self->{dbh}->do(q{
+        CREATE INDEX IF NOT EXISTS idx_clio_updates_time 
+        ON clio_updates(check_time)
+    });
+    
     # Set current schema version
     $self->{dbh}->do(q{
-        INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '3')
+        INSERT OR REPLACE INTO schema_info (key, value) VALUES ('version', '4')
     });
     
     print STDERR "[DEBUG][State] Database initialized: $self->{db_file}\n" 
@@ -589,6 +607,91 @@ sub cleanup_old_data {
         user_responses_deleted => $deleted_user_responses,
         errors_deleted => $deleted_errors,
     };
+}
+
+=head2 record_update
+
+Record a CLIO update check result.
+
+=cut
+
+sub record_update {
+    my ($self, %args) = @_;
+    
+    my $now = time();
+    
+    $self->{dbh}->do(q{
+        INSERT INTO clio_updates 
+            (check_time, current_version, latest_version, update_status, error_message, updated_version)
+        VALUES (?, ?, ?, ?, ?, ?)
+    }, undef, 
+        $now,
+        $args{previous} || '',
+        $args{version}  || '',
+        $args{status}   || 'unknown',
+        $args{error}    || '',
+        $args{version}  || ''
+    );
+}
+
+=head2 record_update_check
+
+Record a CLIO version check (no update performed).
+
+=cut
+
+sub record_update_check {
+    my ($self, $current_version, $latest_version) = @_;
+    
+    my $now = time();
+    
+    $self->{dbh}->do(q{
+        INSERT INTO clio_updates 
+            (check_time, current_version, latest_version, update_status)
+        VALUES (?, ?, ?, ?)
+    }, undef, 
+        $now,
+        $current_version  || '',
+        $latest_version   || '',
+        'checked'
+    );
+}
+
+=head2 get_last_update_check
+
+Get the timestamp and details of the last update check.
+
+=cut
+
+sub get_last_update_check {
+    my ($self) = @_;
+    
+    my $row = $self->{dbh}->selectrow_hashref(q{
+        SELECT * FROM clio_updates 
+        ORDER BY check_time DESC 
+        LIMIT 1
+    });
+    
+    return $row;
+}
+
+=head2 should_check_for_updates
+
+Check if enough time has passed since last update check.
+
+=cut
+
+sub should_check_for_updates {
+    my ($self, $interval_seconds) = @_;
+    
+    $interval_seconds ||= 14400;  # Default 4 hours
+    
+    my $last_check = $self->get_last_update_check();
+    
+    return 1 unless $last_check && $last_check->{check_time};
+    
+    my $elapsed = time() - $last_check->{check_time};
+    return $elapsed >= $interval_seconds;
 }
 
 sub DESTROY {

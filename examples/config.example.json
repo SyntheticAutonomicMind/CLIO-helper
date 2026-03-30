@@ -41,5 +41,8 @@
 
     "stale_warning_days": 30,
     "stale_close_days": 60,
-    "stale_pr_warning_days": 14
+    "stale_pr_warning_days": 14,
+
+    "auto_update_clio": true,
+    "update_check_hours": 4
 }

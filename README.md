@@ -208,6 +208,7 @@ The installer will:
 ```bash
 ./install.sh                # Interactive installation
 ./install.sh -y             # Non-interactive (use defaults)
+./install.sh --user         # User-mode install (no systemd, auto-update CLIO)
 ./install.sh --no-service   # Install without systemd service
 ./install.sh --status       # Check installation status
 ./install.sh --uninstall    # Remove installation
@@ -311,6 +312,14 @@ See `examples/config.example.json` for a full configuration reference with all o
 | `repos_dir` | `~/.clio/repos` | Directory where monitored repos are cloned for code context |
 | `prompts_dir` | (bundled) | Directory containing custom prompt templates |
 | `auto_pull` | true | Git pull latest code before each analysis cycle |
+
+### Auto-Update Settings
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `auto_update_clio` | true | Automatically check for and install CLIO updates |
+| `update_check_hours` | 4 | How often to check for CLIO updates (hours) |
+| `helper_install_dir` | `~/CLIO-helper` | Directory where CLIO-helper is installed (for running install.sh) |
 
 ### GitHub Token Scopes
 

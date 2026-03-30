@@ -36,6 +36,7 @@ GH_VERSION="2.87.0"
 INSTALL_SERVICE=true
 INSTALL_CLIO=true
 INTERACTIVE=true
+USER_MODE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -56,6 +57,13 @@ while [[ $# -gt 0 ]]; do
             INSTALL_CLIO=false
             shift
             ;;
+        --user)
+            USER_MODE=true
+            # User mode: skip service installation, non-interactive
+            INSTALL_SERVICE=false
+            INTERACTIVE=false
+            shift
+            ;;
         --non-interactive|-y)
             INTERACTIVE=false
             shift
@@ -70,6 +78,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --status          Check installation status"
             echo "  --no-service      Install without systemd service"
             echo "  --no-clio         Skip CLIO installation (if already installed)"
+            echo "  --user            User-mode install (no systemd service, non-interactive)"
             echo "  --non-interactive Skip prompts (use defaults)"
             echo "  -y                Same as --non-interactive"
             echo "  --help, -h        Show this help"
