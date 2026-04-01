@@ -314,6 +314,24 @@ sub get_response_count {
     return $count || 0;
 }
 
+=head2 has_any_response
+
+Check if any response has been posted for a given item ID (issue, PR, discussion).
+Unlike get_response_count which only counts 'respond' actions, this counts all
+response types (triage, review, etc).
+
+=cut
+
+sub has_any_response {
+    my ($self, $item_id) = @_;
+    
+    my ($count) = $self->{dbh}->selectrow_array(q{
+        SELECT COUNT(*) FROM responses WHERE discussion_id = ?
+    }, undef, $item_id);
+    
+    return ($count || 0) > 0;
+}
+
 =head2 record_user
 
 Record or update user information and track response to this user.

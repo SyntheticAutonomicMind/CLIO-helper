@@ -157,17 +157,6 @@ sub _poll_repo {
     for my $issue (@$issues) {
         my $issue_id = "issue:$owner/$name#$issue->{number}";
         
-        # Skip if recently processed
-        my $last_check = $self->{state}->get_last_check($issue_id);
-        if ($last_check) {
-            my $age = time() - $last_check;
-            my $cooldown = ($self->{config}{issue_cooldown_minutes} || 60) * 60;
-            if ($age < $cooldown) {
-                $self->_log("DEBUG", "Skipping issue #$issue->{number} (checked ${age}s ago)");
-                next;
-            }
-        }
-        
         # Skip if already has classification labels
         if ($self->_has_triage_labels($issue)) {
             $self->_log("DEBUG", "Skipping issue #$issue->{number} (already triaged)");
@@ -182,9 +171,42 @@ sub _poll_repo {
             next;
         }
         
-        # Skip if last comment is from CLIO/bot (don't respond twice)
+        # Check if we've already responded to this issue (authoritative DB check)
+        my $last_response_time = $self->{state}->get_last_response($issue_id);
+        if ($last_response_time) {
+            # We already posted a response. Only re-process if there's new
+            # user activity on the issue since our response AND cooldown passed.
+            my $age = time() - $last_response_time;
+            my $cooldown = ($self->{config}{issue_cooldown_minutes} || 60) * 60;
+            if ($age < $cooldown) {
+                $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, cooldown ${age}s)");
+                next;
+            }
+            
+            # Cooldown passed - but only re-process if there's new user activity
+            if (!$self->_has_new_user_comments($owner, $name, $issue->{number}, $last_response_time)) {
+                $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, no new user activity)");
+                $self->{state}->record_check($issue_id, 'skip-already-responded');
+                next;
+            }
+            
+            $self->_log("INFO", "Re-checking issue #$issue->{number} (new user activity since our response)");
+        }
+        
+        # Skip if recently checked (even without responding - prevents rapid re-checks)
+        my $last_check = $self->{state}->get_last_check($issue_id);
+        if ($last_check && !$last_response_time) {
+            my $age = time() - $last_check;
+            my $cooldown = ($self->{config}{issue_cooldown_minutes} || 60) * 60;
+            if ($age < $cooldown) {
+                $self->_log("DEBUG", "Skipping issue #$issue->{number} (checked ${age}s ago)");
+                next;
+            }
+        }
+        
+        # Skip if last comment is from CLIO/bot or maintainer (live API check)
         if ($self->_last_comment_is_from_bot($owner, $name, $issue->{number})) {
-            $self->_log("DEBUG", "Skipping issue #$issue->{number} (last comment from bot)");
+            $self->_log("DEBUG", "Skipping issue #$issue->{number} (last comment from bot/maintainer)");
             $self->{state}->record_check($issue_id, 'skip-bot-replied');
             next;
         }
@@ -416,8 +438,10 @@ sub _last_comment_is_from_bot {
     
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
-    # Fetch only the latest comment (gh api returns newest first)
-    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?per_page=1" 2>/dev/null};
+    # Fetch all comments sorted by created date descending, take the first
+    # (GitHub REST API defaults to ascending sort, so we must sort ourselves
+    # or fetch enough to find the last one)
+    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?per_page=100" 2>/dev/null};
     my $response = `$cmd`;
     return 0 if $? != 0;
     
@@ -426,7 +450,9 @@ sub _last_comment_is_from_bot {
     return 0 if $@ || ref($data) ne 'ARRAY';
     return 0 unless @$data;
     
-    my $last_author = $data->[0]->{user}{login} || '';
+    # Last element is the most recent comment (API returns ascending by default)
+    my $last_comment = $data->[-1];
+    my $last_author = $last_comment->{user}{login} || '';
     my $maintainers = $self->{config}{maintainers} || [];
     
     # Check if last commenter is a maintainer (skip if maintainer replied)
@@ -441,6 +467,51 @@ sub _last_comment_is_from_bot {
     return 1 if $last_author =~ /\[bot\]$/;
     return 1 if $last_author eq 'github-actions';
     return 1 if $bot_user && $last_author eq $bot_user;
+    
+    return 0;
+}
+
+=head2 _has_new_user_comments
+
+Check if there are new comments from non-bot users since a given timestamp.
+Used to determine if we should re-process an issue we already responded to.
+
+=cut
+
+sub _has_new_user_comments {
+    my ($self, $owner, $name, $number, $since_ts) = @_;
+    
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+    
+    # Convert epoch to ISO 8601 for GitHub API since parameter
+    my $since_iso = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($since_ts));
+    
+    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?since=$since_iso&per_page=100" 2>/dev/null};
+    my $response = `$cmd`;
+    return 0 if $? != 0;
+    
+    my $data;
+    eval { $data = decode_json($response); };
+    return 0 if $@ || ref($data) ne 'ARRAY';
+    
+    my $bot_user = $self->{config}{bot_username} || '';
+    my $maintainers = $self->{config}{maintainers} || [];
+    
+    for my $comment (@$data) {
+        my $author = $comment->{user}{login} || '';
+        
+        # Skip bot comments
+        next if $author =~ /clio/i;
+        next if $author =~ /\[bot\]$/;
+        next if $author eq 'github-actions';
+        next if $bot_user && $author eq $bot_user;
+        
+        # Skip maintainer comments (maintainers handle it themselves)
+        next if grep { $_ eq $author } @$maintainers;
+        
+        # Found a new user comment since our response
+        return 1;
+    }
     
     return 0;
 }

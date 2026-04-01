@@ -153,27 +153,6 @@ sub _poll_repo {
     for my $pr (@$prs) {
         my $pr_id = "pr:$owner/$name#$pr->{number}";
         
-        # Skip if recently processed (check against last commit SHA)
-        my ($last_check, $last_action) = $self->{state}->get_last_check($pr_id);
-        if ($last_check && $last_action && $last_action =~ /sha:(\w+)/) {
-            my $last_sha = $1;
-            my $head_sha = $pr->{head}{sha} || '';
-            if ($last_sha eq substr($head_sha, 0, 8)) {
-                $self->_log("DEBUG", "Skipping PR #$pr->{number} (no new commits since last review)");
-                next;
-            }
-        }
-        
-        # Apply cooldown
-        if ($last_check) {
-            my $age = time() - $last_check;
-            my $cooldown = ($self->{config}{pr_cooldown_minutes} || 30) * 60;
-            if ($age < $cooldown) {
-                $self->_log("DEBUG", "Skipping PR #$pr->{number} (in cooldown, ${age}s ago)");
-                next;
-            }
-        }
-        
         # Skip draft PRs
         if ($pr->{draft}) {
             $self->_log("DEBUG", "Skipping PR #$pr->{number} (draft)");
@@ -187,12 +166,62 @@ sub _poll_repo {
             next;
         }
         
-        # Skip if last review comment is from CLIO/bot or maintainer
+        # Check if we've already responded to this PR (authoritative DB check)
+        my $last_response_time = $self->{state}->get_last_response($pr_id);
+        if ($last_response_time) {
+            # We already posted a review. Check if there are new commits.
+            my ($last_check, $last_action) = $self->{state}->get_last_check($pr_id);
+            my $has_new_commits = 0;
+            if ($last_action && $last_action =~ /sha:(\w+)/) {
+                my $last_sha = $1;
+                my $head_sha = $pr->{head}{sha} || '';
+                if ($last_sha ne substr($head_sha, 0, 8)) {
+                    $has_new_commits = 1;
+                }
+            }
+            
+            # Only re-review if there are new commits since our last review
+            unless ($has_new_commits) {
+                # Also check for new user comments since our response
+                if (!$self->_has_new_user_comments($owner, $name, $pr->{number}, $last_response_time)) {
+                    $self->_log("DEBUG", "Skipping PR #$pr->{number} (already reviewed, no new commits or user activity)");
+                    $self->{state}->record_check($pr_id, 'skip-already-reviewed');
+                    next;
+                }
+            }
+            
+            # Apply cooldown even for new commits/activity
+            my $age = time() - $last_response_time;
+            my $cooldown = ($self->{config}{pr_cooldown_minutes} || 30) * 60;
+            if ($age < $cooldown) {
+                $self->_log("DEBUG", "Skipping PR #$pr->{number} (in cooldown, ${age}s ago)");
+                next;
+            }
+            
+            $self->_log("INFO", "Re-reviewing PR #$pr->{number} (" .
+                ($has_new_commits ? "new commits" : "new user activity") . ")");
+        } else {
+            # Never responded - apply check cooldown to avoid rapid rechecks
+            my $last_check = $self->{state}->get_last_check($pr_id);
+            if ($last_check) {
+                my $age = time() - $last_check;
+                my $cooldown = ($self->{config}{pr_cooldown_minutes} || 30) * 60;
+                if ($age < $cooldown) {
+                    $self->_log("DEBUG", "Skipping PR #$pr->{number} (in cooldown, ${age}s ago)");
+                    next;
+                }
+            }
+        }
+        
+        # Skip if last review comment is from CLIO/bot or maintainer (live API check)
         if ($self->_last_review_is_from_bot($owner, $name, $pr->{number})) {
-            $self->_log("DEBUG", "Skipping PR #$pr->{number} (last review from bot or maintainer)");
+            $self->_log("DEBUG", "Skipping PR #$pr->{number} (last comment from bot or maintainer)");
             $self->{state}->record_check($pr_id, 'skip-bot-reviewed');
             next;
         }
+        
+        # Claim before processing
+        $self->{state}->record_check($pr_id, 'processing');
         
         # Review this PR
         eval {
@@ -598,8 +627,9 @@ sub _last_review_is_from_bot {
     
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
-    # Fetch only the latest PR review comment (gh api returns newest first)
-    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?per_page=1" 2>/dev/null};
+    # Fetch all comments and check the last one
+    # (GitHub REST API returns ascending by default, so last element is newest)
+    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?per_page=100" 2>/dev/null};
     my $response = `$cmd`;
     return 0 if $? != 0;
     
@@ -608,7 +638,9 @@ sub _last_review_is_from_bot {
     return 0 if $@ || ref($data) ne 'ARRAY';
     return 0 unless @$data;
     
-    my $last_author = $data->[0]->{user}{login} || '';
+    # Last element is the most recent comment
+    my $last_comment = $data->[-1];
+    my $last_author = $last_comment->{user}{login} || '';
     my $maintainers = $self->{config}{maintainers} || [];
     
     # Check if last commenter is a maintainer (skip if maintainer replied)
@@ -623,6 +655,51 @@ sub _last_review_is_from_bot {
     return 1 if $last_author =~ /\[bot\]$/;
     return 1 if $last_author eq 'github-actions';
     return 1 if $bot_user && $last_author eq $bot_user;
+    
+    return 0;
+}
+
+=head2 _has_new_user_comments
+
+Check if there are new comments from non-bot users since a given timestamp.
+Used to determine if we should re-review a PR we already responded to.
+
+=cut
+
+sub _has_new_user_comments {
+    my ($self, $owner, $name, $number, $since_ts) = @_;
+    
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+    
+    # Convert epoch to ISO 8601 for GitHub API since parameter
+    my $since_iso = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($since_ts));
+    
+    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?since=$since_iso&per_page=100" 2>/dev/null};
+    my $response = `$cmd`;
+    return 0 if $? != 0;
+    
+    my $data;
+    eval { $data = decode_json($response); };
+    return 0 if $@ || ref($data) ne 'ARRAY';
+    
+    my $bot_user = $self->{config}{bot_username} || '';
+    my $maintainers = $self->{config}{maintainers} || [];
+    
+    for my $comment (@$data) {
+        my $author = $comment->{user}{login} || '';
+        
+        # Skip bot comments
+        next if $author =~ /clio/i;
+        next if $author =~ /\[bot\]$/;
+        next if $author eq 'github-actions';
+        next if $bot_user && $author eq $bot_user;
+        
+        # Skip maintainer comments (maintainers handle it themselves)
+        next if grep { $_ eq $author } @$maintainers;
+        
+        # Found a new user comment since our response
+        return 1;
+    }
     
     return 0;
 }
