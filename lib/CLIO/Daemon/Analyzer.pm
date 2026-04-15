@@ -11,6 +11,20 @@ use Carp qw(croak);
 use JSON::PP qw(encode_json decode_json);
 use File::Temp qw(tempfile);
 
+=head2 _safe_shell_arg
+
+Sanitize a value for safe interpolation into shell commands.
+Strips characters outside a conservative allowlist.
+
+=cut
+
+sub _safe_shell_arg {
+    my ($val) = @_;
+    return '' unless defined $val;
+    $val =~ s/[^a-zA-Z0-9_\-\.\/\@\: ]//g;
+    return $val;
+}
+
 =head1 NAME
 
 CLIO::Daemon::Analyzer - AI-powered conversation analysis for Discussion Monitor
@@ -404,13 +418,16 @@ sub _run_clio {
     # If we have a repo path, run CLIO from that directory for code context
     my $cd_prefix = '';
     if ($repos_path && -d $repos_path) {
-        $cd_prefix = "cd '$repos_path' && ";
+        my $s_repos_path = _safe_shell_arg($repos_path);
+        $cd_prefix = "cd '$s_repos_path' && ";
         $self->_log("DEBUG", "Running CLIO in repo context: $repos_path");
     }
     
     # Pipe prompt to CLIO
     # Note: stderr is discarded to avoid debug output corrupting JSON extraction
-    my $cmd = qq{${cd_prefix}cat "$temp_file" | $clio --new --model "$model" --exit 2>/dev/null};
+    my $s_clio  = _safe_shell_arg($clio);
+    my $s_model = _safe_shell_arg($model);
+    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new --model "$s_model" --exit 2>/dev/null};
     
     $self->_log("DEBUG", "Running CLIO analysis...");
     

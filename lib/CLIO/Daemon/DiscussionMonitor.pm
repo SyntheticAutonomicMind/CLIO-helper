@@ -13,6 +13,20 @@ use File::Spec;
 use FindBin;
 use POSIX qw(strftime);
 
+=head2 _safe_shell_arg
+
+Sanitize a value for safe interpolation into shell commands.
+Strips characters outside a conservative allowlist.
+
+=cut
+
+sub _safe_shell_arg {
+    my ($val) = @_;
+    return '' unless defined $val;
+    $val =~ s/[^a-zA-Z0-9_\-\.\/\@\: ]//g;
+    return $val;
+}
+
 =head1 NAME
 
 CLIO::Daemon::DiscussionMonitor - GitHub Discussion monitoring daemon
@@ -402,9 +416,11 @@ sub _fetch_discussions {
     
     # Use gh CLI for simplicity (requires gh auth)
     # Note: GitHub Discussions have two levels - comments and replies to comments
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_repo  = _safe_shell_arg($repo);
     my $query = qq{
         query {
-            repository(owner: "$owner", name: "$repo") {
+            repository(owner: "$s_owner", name: "$s_repo") {
                 discussions(first: 30, orderBy: {field: UPDATED_AT, direction: DESC}) {
                     nodes {
                         id
@@ -891,7 +907,7 @@ Post a response to a discussion via GitHub API.
 sub _post_response {
     my ($self, $disc, $message) = @_;
     
-    my $node_id = $disc->{id};
+    my $node_id = _safe_shell_arg($disc->{id});
     
     # Use posting_token if available, otherwise fall back to github_token
     my $posting_token = $self->{config}{posting_token} || $self->{config}{github_token};
@@ -919,7 +935,8 @@ sub _post_response {
     $mutation =~ s/\n/ /g;
     
     # Use GH_TOKEN environment variable to specify which account posts
-    my $cmd = "GH_TOKEN='$posting_token' gh api graphql -f query='$mutation' 2>&1";
+    local $ENV{GH_TOKEN} = $posting_token;
+    my $cmd = "gh api graphql -f query='$mutation' 2>&1";
     my $result = `$cmd`;
     my $exit_code = $? >> 8;
     
@@ -941,8 +958,7 @@ Close a discussion via GitHub GraphQL API (moderation action).
 sub _close_discussion {
     my ($self, $disc) = @_;
     
-    my $node_id = $disc->{id};
-    
+    my $node_id = _safe_shell_arg($disc->{id});    
     # Use posting_token for moderation actions
     my $posting_token = $self->{config}{posting_token} || $self->{config}{github_token};
     
@@ -964,7 +980,8 @@ sub _close_discussion {
     $mutation =~ s/'/'\\''/g;
     $mutation =~ s/\n/ /g;
     
-    my $cmd = "GH_TOKEN='$posting_token' gh api graphql -f query='$mutation' 2>&1";
+    local $ENV{GH_TOKEN} = $posting_token;
+    my $cmd = "gh api graphql -f query='$mutation' 2>&1";
     my $result = `$cmd`;
     my $exit_code = $? >> 8;
     

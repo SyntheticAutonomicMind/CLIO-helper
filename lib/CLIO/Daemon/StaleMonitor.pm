@@ -11,6 +11,20 @@ use Carp qw(croak);
 use JSON::PP qw(encode_json decode_json);
 use POSIX qw(strftime);
 
+=head2 _safe_shell_arg
+
+Sanitize a value for safe interpolation into shell commands.
+Strips characters outside a conservative allowlist.
+
+=cut
+
+sub _safe_shell_arg {
+    my ($val) = @_;
+    return '' unless defined $val;
+    $val =~ s/[^a-zA-Z0-9_\-\.\/\@\: ]//g;
+    return $val;
+}
+
 =head1 NAME
 
 CLIO::Daemon::StaleMonitor - Detect and manage stale issues and PRs
@@ -90,7 +104,9 @@ sub _check_stale_issues {
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
     # Fetch open issues sorted by least recently updated
-    my $cmd = qq{gh api "repos/$owner/$name/issues?state=open&sort=updated&direction=asc&per_page=30" 2>/dev/null};
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/issues?state=open&sort=updated&direction=asc&per_page=30" 2>/dev/null};
     my $response = `$cmd`;
     return if $? != 0;
     
@@ -148,7 +164,9 @@ sub _check_stale_prs {
     
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
-    my $cmd = qq{gh api "repos/$owner/$name/pulls?state=open&sort=updated&direction=asc&per_page=20" 2>/dev/null};
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/pulls?state=open&sort=updated&direction=asc&per_page=20" 2>/dev/null};
     my $response = `$cmd`;
     return if $? != 0;
     
@@ -251,7 +269,7 @@ sub _close_stale_issue {
     
     unless ($self->{config}{dry_run}) {
         local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
-        system(qq{gh issue close --repo "$owner/$name" "$number" --reason "not planned" 2>/dev/null});
+        system('gh', 'issue', 'close', '--repo', "$owner/$name", "$number", '--reason', 'not planned');
     }
     
     $self->_log("INFO", "Closed stale issue $owner/$name#$number ($days days)");
@@ -299,7 +317,7 @@ sub _post_comment {
     print $fh $body;
     close $fh;
     
-    system(qq{gh issue comment --repo "$owner/$name" "$number" --body-file "$tmpfile" 2>/dev/null});
+    system('gh', 'issue', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
 }
 
 =head2 _add_label
@@ -315,8 +333,9 @@ sub _add_label {
     
     local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
     
-    system(qq{gh label create --repo "$owner/$name" "$label" --color "fef2c0" 2>/dev/null});
-    system(qq{gh issue edit --repo "$owner/$name" "$number" --add-label "$label" 2>/dev/null});
+    my $s_label = _safe_shell_arg($label);
+    system('gh', 'label', 'create', '--repo', "$owner/$name", $s_label, '--color', 'fef2c0');
+    system('gh', 'issue', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $s_label);
 }
 
 =head2 _parse_date

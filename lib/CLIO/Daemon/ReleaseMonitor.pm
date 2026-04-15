@@ -11,6 +11,20 @@ use Carp qw(croak);
 use JSON::PP qw(encode_json decode_json);
 use POSIX qw(strftime);
 
+=head2 _safe_shell_arg
+
+Sanitize a value for safe interpolation into shell commands.
+Strips characters outside a conservative allowlist.
+
+=cut
+
+sub _safe_shell_arg {
+    my ($val) = @_;
+    return '' unless defined $val;
+    $val =~ s/[^a-zA-Z0-9_\-\.\/\@\: ]//g;
+    return $val;
+}
+
 =head1 NAME
 
 CLIO::Daemon::ReleaseMonitor - Monitor releases and generate changelogs
@@ -85,7 +99,9 @@ sub _check_releases {
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
     # Fetch latest release
-    my $cmd = qq{gh api "repos/$owner/$name/releases/latest" 2>/dev/null};
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/releases/latest" 2>/dev/null};
     my $response = `$cmd`;
     return if $? != 0;
     
@@ -137,7 +153,9 @@ sub _get_previous_release {
     
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
-    my $cmd = qq{gh api "repos/$owner/$name/releases?per_page=5" 2>/dev/null};
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/releases?per_page=5" 2>/dev/null};
     my $response = `$cmd`;
     return '' if $? != 0;
     
@@ -170,7 +188,10 @@ sub _generate_changelog {
     
     # Use GitHub compare API for commit list
     my $range = $from_tag ? "$from_tag...$to_tag" : $to_tag;
-    my $cmd = qq{gh api "repos/$owner/$name/compare/$range" --jq '.commits[].commit.message' 2>/dev/null};
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $s_range = _safe_shell_arg($range);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/compare/$s_range" --jq '.commits[].commit.message' 2>/dev/null};
     my $response = `$cmd`;
     
     return '' if $? != 0 || !$response;
@@ -261,7 +282,10 @@ sub _update_release_notes {
     print $fh $json;
     close $fh;
     
-    my $result = system(qq{gh api "repos/$owner/$name/releases/$release_id" -X PATCH --input "$tmpfile" 2>/dev/null});
+    my $s_owner      = _safe_shell_arg($owner);
+    my $s_name       = _safe_shell_arg($name);
+    my $s_release_id = _safe_shell_arg($release_id);
+    my $result = system(qq{gh api "repos/$s_owner/$s_name/releases/$s_release_id" -X PATCH --input "$tmpfile" 2>/dev/null});
     
     if ($result != 0) {
         $self->_log("ERROR", "Failed to update release notes for $owner/$name");

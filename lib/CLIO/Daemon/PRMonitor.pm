@@ -13,6 +13,20 @@ use File::Spec;
 use POSIX qw(strftime);
 use FindBin;
 
+=head2 _safe_shell_arg
+
+Sanitize a value for safe interpolation into shell commands.
+Strips characters outside a conservative allowlist.
+
+=cut
+
+sub _safe_shell_arg {
+    my ($val) = @_;
+    return '' unless defined $val;
+    $val =~ s/[^a-zA-Z0-9_\-\.\/\@\: ]//g;
+    return $val;
+}
+
 =head1 NAME
 
 CLIO::Daemon::PRMonitor - GitHub Pull Request review monitor
@@ -247,7 +261,10 @@ sub _fetch_prs {
     
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
-    my $cmd = qq{gh api "repos/$owner/$name/pulls?state=open&sort=updated&direction=desc&per_page=$limit" 2>/dev/null};
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $s_limit = _safe_shell_arg($limit);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/pulls?state=open&sort=updated&direction=desc&per_page=$s_limit" 2>/dev/null};
     my $response = `$cmd`;
     return [] if $? != 0;
     
@@ -468,8 +485,9 @@ sub _apply_labels {
         next unless $label;
         
         $self->_log("INFO", "  Adding label: $label");
-        system(qq{gh label create --repo "$owner/$name" "$label" --color "c5def5" 2>/dev/null});
-        system(qq{gh pr edit --repo "$owner/$name" "$number" --add-label "$label" 2>/dev/null});
+        my $s_label = _safe_shell_arg($label);
+        system('gh', 'label', 'create', '--repo', "$owner/$name", $s_label, '--color', 'c5def5');
+        system('gh', 'pr', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $s_label);
     }
 }
 
@@ -546,7 +564,10 @@ sub _fetch_pr_diff {
     
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
-    my $cmd = qq{gh api "repos/$owner/$name/pulls/$number" -H "Accept: application/vnd.github.diff" 2>/dev/null};
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/pulls/$s_number" -H "Accept: application/vnd.github.diff" 2>/dev/null};
     my $diff = `$cmd`;
     return '' if $? != 0;
     
@@ -570,7 +591,10 @@ sub _fetch_pr_files {
     
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
-    my $cmd = qq{gh api "repos/$owner/$name/pulls/$number/files" 2>/dev/null};
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/pulls/$s_number/files" 2>/dev/null};
     my $response = `$cmd`;
     return [] if $? != 0;
     
@@ -593,7 +617,10 @@ sub _fetch_pr_comments {
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
     # Get issue-level comments
-    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments" 2>/dev/null};
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/issues/$s_number/comments" 2>/dev/null};
     my $response = `$cmd`;
     
     my @comments;
@@ -629,7 +656,10 @@ sub _last_review_is_from_bot {
     
     # Fetch all comments and check the last one
     # (GitHub REST API returns ascending by default, so last element is newest)
-    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?per_page=100" 2>/dev/null};
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/issues/$s_number/comments?per_page=100" 2>/dev/null};
     my $response = `$cmd`;
     return 0 if $? != 0;
     
@@ -674,7 +704,11 @@ sub _has_new_user_comments {
     # Convert epoch to ISO 8601 for GitHub API since parameter
     my $since_iso = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($since_ts));
     
-    my $cmd = qq{gh api "repos/$owner/$name/issues/$number/comments?since=$since_iso&per_page=100" 2>/dev/null};
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $s_since  = _safe_shell_arg($since_iso);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/issues/$s_number/comments?since=$s_since&per_page=100" 2>/dev/null};
     my $response = `$cmd`;
     return 0 if $? != 0;
     
@@ -725,7 +759,7 @@ sub _post_review {
     print $fh $body;
     close $fh;
     
-    my $result = system(qq{gh pr comment --repo "$owner/$name" "$number" --body-file "$tmpfile" 2>/dev/null});
+    my $result = system('gh', 'pr', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
     
     if ($result != 0) {
         $self->_log("ERROR", "Failed to post review on $owner/$name#$number");
