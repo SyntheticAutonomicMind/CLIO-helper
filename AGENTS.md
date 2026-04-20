@@ -394,7 +394,7 @@ $self->{dbh}->do(q{
 | `repos` | `.github` | Array of `{owner, repo}` to monitor |
 | `poll_interval_seconds` | 120 | Polling frequency |
 | `github_token` | `$GH_TOKEN` | GitHub personal access token |
-| `model` | `gpt-5-mini` | AI model for analysis |
+| `model` | `minimax/MiniMax-M2.7` | AI model in provider/model format |
 | `dry_run` | false | Analyze without posting |
 | `maintainers` | `[]` | Usernames to skip |
 | `max_response_age_hours` | 24 | Don't respond to old discussions |

@@ -65,7 +65,7 @@ Config file (~/.clio/discuss-config.json):
         ],
         "poll_interval_seconds": 120,
         "github_token": "ghp_...",
-        "model": "gpt-5-mini",
+        "model": "minimax/MiniMax-M2.7",
         "dry_run": false,
         "maintainers": ["fewtarius"],
         "log_file": "~/.clio/discuss-daemon.log"
@@ -167,7 +167,7 @@ sub _default_config {
        poll_interval_seconds => 120,  # 2 minutes
        github_token => $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
        posting_token => $ENV{CLIO_POSTING_TOKEN} || '',  # Separate token for posting comments (optional)
-       model => 'gpt-5-mini',
+       model => 'minimax/MiniMax-M2.7',
        dry_run => 0,
        maintainers => ['fewtarius'],
        bot_username => '',  # Bot's GitHub username (auto-detected if empty)

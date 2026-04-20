@@ -280,7 +280,7 @@ Create `~/.clio/helper-config.json`:
     "poll_interval_seconds": 120,
     "github_token": "ghp_your_token_here",
     "posting_token": "",
-    "model": "MiniMax-M2.7",
+    "model": "minimax/MiniMax-M2.7",
     "dry_run": false,
     "maintainers": ["your-username"]
 }
@@ -297,7 +297,7 @@ See `examples/config.example.json` for a full configuration reference with all o
 | `poll_interval_seconds` | 120 | How often to poll for updates (seconds) |
 | `github_token` | `$GH_TOKEN` | GitHub personal access token |
 | `posting_token` | (none) | Separate token for posting comments (optional; falls back to `github_token`) |
-| `model` | `MiniMax-M2.7` | AI model for CLIO analysis (any CLIO-supported model) |
+| `model` | `minimax/MiniMax-M2.7` | AI model in provider/model format (any CLIO-supported model) |
 | `clio_path` | `clio` | Path to CLIO executable |
 | `dry_run` | false | Analyze without posting responses |
 | `maintainers` | `[]` | GitHub usernames to skip (they handle their own threads) |

@@ -34,7 +34,7 @@ CLIO::Daemon::Analyzer - AI-powered conversation analysis for Discussion Monitor
     use CLIO::Daemon::Analyzer;
     
     my $analyzer = CLIO::Daemon::Analyzer->new(
-        model => 'gpt-5-mini',
+        model => 'minimax/MiniMax-M2.7',
         debug => 1,
     );
     
@@ -57,7 +57,7 @@ Uses CLIO AI capabilities to:
 Create a new Analyzer instance.
 
 Arguments (hash):
-- model: AI model name (default: gpt-5-mini)
+- model: AI model name in provider/model format (default: minimax/MiniMax-M2.7)
 - debug: Enable debug logging (default: 0)
 - clio_path: Path to CLIO executable (default: 'clio')
 - repos_path: Path to cloned repos for code context (optional)
@@ -70,7 +70,7 @@ sub new {
     my ($class, %args) = @_;
     
     my $self = {
-        model         => $args{model} || 'gpt-5-mini',
+        model         => $args{model} || 'minimax/MiniMax-M2.7',
         debug         => $args{debug} || 0,
         clio_path     => $args{clio_path} || 'clio',
         repos_path    => $args{repos_path} || '',   # Path to cloned repos for context
@@ -427,7 +427,7 @@ sub _run_clio {
     # Note: stderr is discarded to avoid debug output corrupting JSON extraction
     my $s_clio  = _safe_shell_arg($clio);
     my $s_model = _safe_shell_arg($model);
-    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new --model "$s_model" --exit 2>/dev/null};
+    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new --model "$s_model" --no-custom-instructions --no-ltm --exit 2>/dev/null};
     
     $self->_log("DEBUG", "Running CLIO analysis...");
     
