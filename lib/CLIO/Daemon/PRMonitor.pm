@@ -306,7 +306,7 @@ sub _review_pr {
     # Run analysis
     my $result = $self->{analyzer}->analyze($context);
     
-    unless ($result && $result->{action}) {
+    unless ($result && $result->{action} && $result->{action} ne 'skip') {
         $self->_log("WARN", "No actionable result from analyzer for PR #$number");
         $self->{state}->record_check($pr_id, "no-result:sha:$head_sha");
         return;
@@ -316,10 +316,12 @@ sub _review_pr {
     # fall back to extracting from raw message
     my $review = $result->{review} || $self->_extract_review_json($result);
     
+    my $posted = 0;
     if ($review) {
         # Format and post structured review
         my $comment = $self->_format_review_comment($review, $is_update);
         $self->_post_review($owner, $name, $number, $comment);
+        $posted = 1;
         
         # Apply labels
         my @labels = @{$review->{suggested_labels} || []};
@@ -327,9 +329,16 @@ sub _review_pr {
     } elsif ($result->{action} eq 'respond' && $result->{message}) {
         # Fall back to raw message if JSON extraction fails
         $self->_post_review($owner, $name, $number, $result->{message});
+        $posted = 1;
     }
     
-    $self->{state}->record_response($pr_id, "reviewed:sha:$head_sha", $result->{message} || '');
+    # Only record as reviewed if we actually posted something
+    if ($posted) {
+        $self->{state}->record_response($pr_id, "reviewed:sha:$head_sha", $result->{message} || '');
+    } else {
+        $self->_log("WARN", "PR #$number analysis produced no review content, not recording as reviewed");
+        $self->{state}->record_check($pr_id, "no-review-content:sha:$head_sha");
+    }
 }
 
 =head2 _extract_review_json
