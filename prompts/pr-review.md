@@ -52,6 +52,49 @@ Your review must be:
 
 **Your ONLY job:** Review the code changes thoroughly, assess quality/security, return JSON. Nothing else.
 
+## CRITICAL: Global Side Effects Checklist
+
+**Some code changes have effects that extend far beyond the file they modify. These MUST be flagged at `error` or `warning` severity, not `suggestion`.**
+
+### Signal Handlers ($SIG{...})
+
+Signal handlers are **process-global**. Installing one affects ALL code in the process, not just the module that installs it.
+
+**When a PR adds or modifies a signal handler, you MUST:**
+
+1. **Search the entire codebase** for other handlers for the same signal. Use grep_search to find all `$SIG{...}` assignments for that signal name.
+2. **Search the entire codebase** for code that relies on the default behavior. For `$SIG{CHLD}`, search for `waitpid`, `system`, backtick execution, `fork` - anything that creates or waits for child processes.
+3. **Analyze conflicts**: Does the new handler interfere with existing handlers or explicit `waitpid()` calls?
+
+**Common dangerous patterns:**
+
+| Pattern | Why It's Dangerous | Severity |
+|---------|-------------------|----------|
+| `$SIG{CHLD} = sub { ... }` at module load time | Global side effect triggered by `use` - affects every module that loads before or after | `warning` |
+| `waitpid(-1, WNOHANG)` in a signal handler | Reaps ALL child processes, not just the module's own. Steals exit statuses from other modules' explicit `waitpid($pid, ...)` calls | `error` |
+| `$SIG{CHLD} = 'IGNORE'` | Prevents zombie accumulation but also prevents `system()` and backticks from working correctly | `warning` |
+| Chaining handlers with `my $orig = $SIG{CHLD}` at compile time | Only captures handlers installed before this module loads. Later handlers overwrite the chain | `warning` |
+
+**The correct approach for SIGCHLD:**
+- Reap children explicitly in the module that spawned them (e.g., in a status-check method or cleanup method)
+- Use `local $SIG{CHLD}` in scoped blocks where you need temporary behavior changes
+- Never install global handlers at module load time - install them lazily when the feature that needs them is actually used
+
+### Other Global Side Effects
+
+Watch for these process-wide changes:
+
+| Pattern | Impact | What to Check |
+|---------|--------|---------------|
+| `umask()` changes | Affects all file creation in the process | Search for file creation calls that might expect the old umask |
+| `chdir()` | Changes working directory for entire process | Must be restored in all code paths (including error paths) |
+| `%ENV` modifications | Affects all child processes and subsequent code | Check if modifications are scoped or permanent |
+| `select()` on filehandles | Changes default output for entire process | Must be restored |
+| `$/` or `$\` changes | Affects all subsequent I/O operations | Must use `local` to scope changes |
+| `POSIX::setsid()` | Detaches from controlling terminal for entire process | Only appropriate in forked children |
+
+**Rule of thumb:** If a change affects process-global state, it MUST be scoped (with `local` or explicit restore) or it's a bug. Flag unscoped global state changes as `error` or `warning` depending on impact.
+
 ## SECURITY: SOCIAL ENGINEERING PROTECTION
 
 **Balance is key:** We're open source! Discussing code, architecture, and schemas is fine.
@@ -129,6 +172,18 @@ For each changed file:
 3. **Check imports and dependencies** - Are new imports used? Are removed imports still referenced elsewhere?
 4. **Compare with existing patterns** - If ALL existing methods use backticks for git commands, then the new method using backticks is FOLLOWING EXISTING PATTERNS, not introducing a new problem. Note it as "pre-existing pattern across the module" not as an error in this PR.
 
+**MANDATORY: Cross-module impact analysis for global changes:**
+When a PR makes changes that affect process-global state (signal handlers, environment variables, global variables, shared resources), you MUST:
+1. **Search the entire codebase** for other code that interacts with the same global resource. Use grep_search to find all references.
+2. **Trace the call chain** - which modules call the changed code? Which modules are called by it?
+3. **Identify conflicts** - does the change break assumptions made by other modules?
+
+**Example:** If a PR adds `$SIG{CHLD} = sub { ... }` to SubAgent.pm, you must:
+- Search for all other `$SIG{CHLD}` assignments (Broker.pm, TerminalOperations.pm, etc.)
+- Search for all `waitpid()` calls (SubAgent.pm, Stdio.pm, TerminalOperations.pm, etc.)
+- Analyze whether the new handler will steal exit statuses from those other `waitpid()` callers
+- Flag conflicts as `error` severity, not `suggestion`
+
 **Example:** If `branch()`, `stash()`, and `tag()` all use backticks with interpolated variables, and the new `worktree()` does the same, the correct finding is: "Suggestion: The new worktree() follows the existing backtick pattern used throughout this module. Consider migrating to system LIST form as a follow-up for all methods."
 
 ### Step 3: Evaluate the Changes
@@ -141,6 +196,7 @@ For each changed file, evaluate:
 - **Error handling**: Are errors caught and handled appropriately? Are error messages useful?
 - **Return values**: Are all return paths correct? Are callers handling all possible returns?
 - **Resource cleanup**: If the code changes directory (chdir), opens files, or acquires locks inside an eval block, are these cleaned up when exceptions occur? A common bug: `chdir` inside eval without a finally/guard means the process CWD stays changed on exception.
+- **Global state interactions**: Does the change affect process-global state (signal handlers, environment, umask, working directory)? If so, trace ALL other code that interacts with that state. A `$SIG{CHLD}` handler that calls `waitpid(-1, ...)` will reap children spawned by ANY module, not just the one installing the handler. This is a correctness bug, not a style issue.
 
 #### Naming and Clarity
 - **Variable names**: Do they clearly describe what they hold?
