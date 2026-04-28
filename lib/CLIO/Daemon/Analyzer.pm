@@ -106,8 +106,8 @@ sub analyze {
     # Run CLIO to analyze
     my $response = $self->_run_clio($prompt, $repos_path);
     
-    # Parse the response
-    my $result = $self->_parse_response($response);
+    # Parse the response, passing context for metadata
+    my $result = $self->_parse_response($response, $context);
     
     return $result;
 }
@@ -200,6 +200,16 @@ sub _build_pr_prompt {
     $pr_context .= "**URL:** $disc->{url}\n";
     $pr_context .= "**Base:** `$disc->{base}` <- **Head:** `$disc->{head}`\n";
     $pr_context .= "**Head SHA:** `$disc->{head_sha}`\n\n";
+    
+    # Re-review context
+    if ($context->{re_review}) {
+        $pr_context .= "**THIS IS A RE-REVIEW REQUESTED BY A MAINTAINER.**\n\n";
+        if ($context->{re_review_request}) {
+            $pr_context .= "### Maintainer's Re-Review Request\n\n";
+            $pr_context .= $context->{re_review_request} . "\n\n";
+        }
+        $pr_context .= "Perform a full re-review of this PR. Apply the same standards and safety protocols as an initial review. Do not assume previous review findings are still valid - re-examine all changes from scratch. The maintainer may have specific concerns they want addressed.\n\n";
+    }
 
     # PR description
     $pr_context .= "### Description\n\n";
@@ -457,7 +467,9 @@ Handles three response formats:
 =cut
 
 sub _parse_response {
-    my ($self, $response) = @_;
+    my ($self, $response, $context) = @_;
+    
+    $context //= {};
     
     # Strip ANSI escape codes from response (CLIO may output colored text)
     $response =~ s/\x{1b}\[[0-9;]*[mK]//g;
@@ -527,10 +539,11 @@ sub _parse_response {
     } elsif ($parsed->{recommendation} && !$parsed->{action}) {
         # PR review response - convert to standard format
         $result = {
-            action  => 'respond',
-            reason  => "Review: $parsed->{recommendation}",
-            message => $parsed->{summary} || '',
-            review  => $parsed,  # Preserve full review data
+            action     => 'respond',
+            reason     => "Review: $parsed->{recommendation}",
+            message    => $parsed->{summary} || '',
+            review     => $parsed,  # Preserve full review data
+            _re_review => $context->{re_review} || 0,  # Pass through re-review flag
         };
     } else {
         # Standard discussion response format

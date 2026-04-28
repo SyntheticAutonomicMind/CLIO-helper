@@ -228,7 +228,17 @@ sub _poll_repo {
         }
         
         # Skip if last review comment is from CLIO/bot or maintainer (live API check)
-        if ($self->_last_review_is_from_bot($owner, $name, $pr->{number})) {
+        # BUT: if a maintainer requested re-review, don't skip
+        my $re_review_requested = 0;
+        if ($last_response_time) {
+            my $re_review_ctx = $self->_get_re_review_context($owner, $name, $pr->{number}, $last_response_time);
+            if ($re_review_ctx) {
+                $re_review_requested = 1;
+                $self->_log("INFO", "Re-review requested by maintainer for PR #$pr->{number}");
+            }
+        }
+        
+        if (!$re_review_requested && $self->_last_review_is_from_bot($owner, $name, $pr->{number})) {
             $self->_log("DEBUG", "Skipping PR #$pr->{number} (last comment from bot or maintainer)");
             $self->{state}->record_check($pr_id, 'skip-bot-reviewed');
             next;
@@ -237,9 +247,15 @@ sub _poll_repo {
         # Claim before processing
         $self->{state}->record_check($pr_id, 'processing');
         
+        # Check for re-review context
+        my $re_review_context = '';
+        if ($last_response_time) {
+            $re_review_context = $self->_get_re_review_context($owner, $name, $pr->{number}, $last_response_time);
+        }
+        
         # Review this PR
         eval {
-            $self->_review_pr($owner, $name, $pr);
+            $self->_review_pr($owner, $name, $pr, $re_review_context);
         };
         if ($@) {
             $self->_log("ERROR", "Failed to review $owner/$name#$pr->{number}: $@");
@@ -285,7 +301,7 @@ Analyze and review a single PR.
 =cut
 
 sub _review_pr {
-    my ($self, $owner, $name, $pr) = @_;
+    my ($self, $owner, $name, $pr, $re_review_context) = @_;
     
     my $number = $pr->{number};
     my $pr_id = "pr:$owner/$name#$number";
@@ -302,6 +318,12 @@ sub _review_pr {
     
     # Build context
     my $context = $self->_build_pr_context($owner, $name, $pr);
+    
+    # Add re-review context if present
+    if ($re_review_context && length($re_review_context)) {
+        $context->{re_review} = 1;
+        $context->{re_review_request} = $re_review_context;
+    }
     
     # Run analysis
     my $result = $self->{analyzer}->analyze($context);
@@ -400,6 +422,12 @@ sub _format_review_comment {
     }
     
     my $header = $is_update ? "CLIO Automated Review (Updated)" : "CLIO Automated Review";
+    
+    # Indicate if this was a requested re-review
+    my $is_re_review = $review->{_re_review} || 0;
+    if ($is_re_review) {
+        $header = "CLIO Automated Re-Review (Requested)";
+    }
     
     my $comment = "## $emoji $header: $verdict\n\n";
     $comment .= "**Summary:** $summary\n\n";
@@ -737,14 +765,93 @@ sub _has_new_user_comments {
         next if $author eq 'github-actions';
         next if $bot_user && $author eq $bot_user;
         
-        # Skip maintainer comments (maintainers handle it themselves)
-        next if grep { $_ eq $author } @$maintainers;
+        # Check for re-review request from maintainer BEFORE skipping
+        if (grep { $_ eq $author } @$maintainers) {
+            if ($self->_is_re_review_request($comment->{body} || '')) {
+                return 1;  # Treat as new activity requiring re-review
+            }
+            next;  # Skip other maintainer comments
+        }
         
         # Found a new user comment since our response
         return 1;
     }
     
     return 0;
+}
+
+=head2 _is_re_review_request
+
+Check if a comment body contains a re-review request.
+
+Recognized patterns (case-insensitive):
+- "re-review" / "re review" / "rereview"
+- "please re-review" / "re-review this"
+- "@clio-bot re-review" / "@clio re-review"
+- "review again" / "review this again"
+- "recheck" / "re-check"
+
+=cut
+
+sub _is_re_review_request {
+    my ($self, $body) = @_;
+    return 0 unless defined $body && length($body);
+    
+    # Normalize whitespace for matching
+    my $normalized = $body;
+    $normalized =~ s/\s+/ /g;
+    
+    # Match re-review patterns
+    return 1 if $normalized =~ /\bre-?\s*review\b/i;
+    return 1 if $normalized =~ /\brereview\b/i;
+    return 1 if $normalized =~ /\breview\s+again\b/i;
+    return 1 if $normalized =~ /\bre-?\s*check\b/i;
+    return 1 if $normalized =~ /\brecheck\b/i;
+    
+    return 0;
+}
+
+=head2 _get_re_review_context
+
+Extract re-review context from maintainer comments since a given timestamp.
+Returns the body of the most recent re-review request, or empty string.
+
+=cut
+
+sub _get_re_review_context {
+    my ($self, $owner, $name, $number, $since_ts) = @_;
+    
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+    
+    my $since_iso = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($since_ts));
+    
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $s_since  = _safe_shell_arg($since_iso);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/issues/$s_number/comments?since=$s_since&per_page=100" 2>/dev/null};
+    my $response = `$cmd`;
+    return '' if $? != 0;
+    
+    my $data;
+    eval { $data = decode_json($response); };
+    return '' if $@ || ref($data) ne 'ARRAY';
+    
+    my $maintainers = $self->{config}{maintainers} || [];
+    my $bot_user = $self->{config}{bot_username} || '';
+    
+    # Find the most recent re-review request from a maintainer
+    for my $comment (reverse @$data) {
+        my $author = $comment->{user}{login} || '';
+        next unless grep { $_ eq $author } @$maintainers;
+        next if $bot_user && $author eq $bot_user;
+        
+        if ($self->_is_re_review_request($comment->{body} || '')) {
+            return $comment->{body};
+        }
+    }
+    
+    return '';
 }
 
 =head2 _post_review
