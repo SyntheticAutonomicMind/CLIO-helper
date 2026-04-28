@@ -74,6 +74,10 @@ sub new {
     
     # Auto-detect bot_username if not configured
     unless ($self->{config}{bot_username}) {
+        # Use posting_token (the bot's token) to detect the bot username,
+        # not github_token (which may be a personal token for a maintainer)
+        my $detect_token = $self->{config}{posting_token} || $self->{gh_token};
+        local $ENV{GH_TOKEN} = $detect_token if $detect_token;
         my $gh_user = `gh api user --jq '.login' 2>/dev/null`;
         if ($gh_user && $? == 0) {
             chomp $gh_user;

@@ -73,6 +73,10 @@ sub new {
     
     # Auto-detect bot_username if not configured
     unless ($self->{config}{bot_username}) {
+        # Use posting_token (the bot's token) to detect the bot username,
+        # not github_token (which may be a personal token for a maintainer)
+        my $detect_token = $self->{config}{posting_token} || $self->{gh_token};
+        local $ENV{GH_TOKEN} = $detect_token if $detect_token;
         my $gh_user = `gh api user --jq '.login' 2>/dev/null`;
         if ($gh_user && $? == 0) {
             chomp $gh_user;
@@ -184,12 +188,13 @@ sub _poll_repo {
         my $last_response_time = $self->{state}->get_last_response($pr_id);
         if ($last_response_time) {
             # We already posted a review. Check if there are new commits.
-            my ($last_check, $last_action) = $self->{state}->get_last_check($pr_id);
             my $has_new_commits = 0;
-            if ($last_action && $last_action =~ /sha:(\w+)/) {
-                my $last_sha = $1;
+            # Get the SHA from the most recent response (not from discussion_checks,
+            # which gets overwritten with skip-* actions on subsequent checks)
+            my $last_review_sha = $self->_get_last_review_sha($pr_id);
+            if ($last_review_sha) {
                 my $head_sha = $pr->{head}{sha} || '';
-                if ($last_sha ne substr($head_sha, 0, 8)) {
+                if ($last_review_sha ne substr($head_sha, 0, length($last_review_sha))) {
                     $has_new_commits = 1;
                 }
             }
@@ -759,19 +764,21 @@ sub _has_new_user_comments {
     for my $comment (@$data) {
         my $author = $comment->{user}{login} || '';
         
-        # Skip bot comments
-        next if $author =~ /clio/i;
-        next if $author =~ /\[bot\]$/;
-        next if $author eq 'github-actions';
-        next if $bot_user && $author eq $bot_user;
-        
-        # Check for re-review request from maintainer BEFORE skipping
+        # Check for re-review request from maintainer FIRST
+        # (must come before bot skip, since maintainer may also be bot_username
+        # if github_token is a personal token)
         if (grep { $_ eq $author } @$maintainers) {
             if ($self->_is_re_review_request($comment->{body} || '')) {
                 return 1;  # Treat as new activity requiring re-review
             }
             next;  # Skip other maintainer comments
         }
+        
+        # Skip bot comments
+        next if $author =~ /clio/i;
+        next if $author =~ /\[bot\]$/;
+        next if $author eq 'github-actions';
+        next if $bot_user && $author eq $bot_user;
         
         # Found a new user comment since our response
         return 1;
@@ -844,7 +851,6 @@ sub _get_re_review_context {
     for my $comment (reverse @$data) {
         my $author = $comment->{user}{login} || '';
         next unless grep { $_ eq $author } @$maintainers;
-        next if $bot_user && $author eq $bot_user;
         
         if ($self->_is_re_review_request($comment->{body} || '')) {
             return $comment->{body};
@@ -852,6 +858,28 @@ sub _get_re_review_context {
     }
     
     return '';
+}
+
+=head2 _get_last_review_sha
+
+Get the SHA from the most recent review response for a PR.
+Uses the responses table (not discussion_checks) since the
+discussion_checks last_action gets overwritten with skip-* actions.
+
+=cut
+
+sub _get_last_review_sha {
+    my ($self, $pr_id) = @_;
+    
+    my $history = $self->{state}->get_response_history($pr_id, 10);
+    for my $resp (@$history) {
+        my $action = $resp->{action} || '';
+        if ($action =~ /sha:(\w+)/) {
+            return $1;
+        }
+    }
+    
+    return undef;
 }
 
 =head2 _post_review
