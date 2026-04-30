@@ -245,6 +245,11 @@ sub _sync_repo {
     my $repos_dir = $self->{config}{repos_dir};
     $repos_dir =~ s/^~/$ENV{HOME}/;
     
+    # Sanitize for shell interpolation
+    my $s_repos_dir = _safe_shell_arg($repos_dir);
+    my $s_owner     = _safe_shell_arg($owner);
+    my $s_name      = _safe_shell_arg($name);
+    
     # Create repos directory if needed
     unless (-d $repos_dir) {
         require File::Path;
@@ -253,17 +258,18 @@ sub _sync_repo {
     }
     
     my $repo_path = "$repos_dir/$owner/$name";
+    my $s_repo_path = "$s_repos_dir/$s_owner/$s_name";
     
     if (-d "$repo_path/.git") {
         # Repo exists, pull latest
         $self->_log("DEBUG", "Pulling latest for $owner/$name");
-        my $result = `cd "$repo_path" && git pull --rebase 2>&1`;
+        my $result = `cd "$s_repo_path" && git pull --rebase 2>&1`;
         my $exit_code = $? >> 8;
         
         if ($exit_code != 0) {
             $self->_log("WARN", "Git pull failed for $owner/$name: $result");
             # Try reset and pull
-            `cd "$repo_path" && git fetch origin && git reset --hard origin/HEAD 2>&1`;
+            `cd "$s_repo_path" && git fetch origin && git reset --hard origin/HEAD 2>&1`;
         }
     } else {
         # Clone the repo
@@ -272,8 +278,8 @@ sub _sync_repo {
         require File::Path;
         File::Path::mkpath("$repos_dir/$owner");
         
-        my $clone_url = "https://github.com/$owner/$name.git";
-        my $result = `git clone --depth 1 "$clone_url" "$repo_path" 2>&1`;
+        my $clone_url = "https://github.com/$s_owner/$s_name.git";
+        my $result = `git clone --depth 1 "$clone_url" "$s_repo_path" 2>&1`;
         my $exit_code = $? >> 8;
         
         if ($exit_code != 0) {

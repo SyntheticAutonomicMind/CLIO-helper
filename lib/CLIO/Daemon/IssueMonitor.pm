@@ -338,6 +338,31 @@ sub _triage_issue {
     # Build context for the analyzer
     my $context = $self->_build_issue_context($owner, $name, $issue);
     
+    # Pre-filter with programmatic guardrails
+    my $guardrail_result = $self->_check_guardrails($context);
+    if ($guardrail_result->{action} ne 'proceed') {
+        $self->_log("INFO", "Guardrails triggered for issue #$number: $guardrail_result->{action}");
+        $self->_log("DEBUG", "Flags: " . join(', ', @{$guardrail_result->{flags}}));
+        
+        if ($guardrail_result->{action} eq 'moderate') {
+            # High-severity: skip triage and close the issue
+            $self->_log("WARN", "Issue #$number blocked by guardrails: " .
+                join(', ', @{$guardrail_result->{flags}}));
+            my $triage = {
+                recommendation => 'close',
+                close_reason   => 'Closed by automated moderation.',
+                summary       => 'Content flagged by security guardrails.',
+            };
+            $self->_post_close_comment($owner, $name, $number, $triage);
+            $self->{state}->record_response($issue_id, 'auto_moderate',
+                "Guardrail flags: " . join(', ', @{$guardrail_result->{flags}}));
+            return;
+        } elsif ($guardrail_result->{action} eq 'flag') {
+            # Medium-severity: proceed with caution
+            $self->_log("INFO", "Issue #$number flagged by guardrails - proceeding with caution");
+        }
+    }
+    
     # Run analysis
     my $result = $self->{analyzer}->analyze($context);
     
@@ -840,6 +865,34 @@ sub _post_comment {
     } else {
         $self->_log("INFO", "Posted triage comment on $owner/$name#$number");
     }
+}
+
+=head2 _check_guardrails
+
+Run programmatic guardrails on issue content before AI analysis.
+Checks title, body, and comments for prompt injection, social engineering,
+encoded content, and invisible character attacks.
+
+=cut
+
+sub _check_guardrails {
+    my ($self, $context) = @_;
+    
+    require CLIO::Daemon::Guardrails;
+    my $guard = CLIO::Daemon::Guardrails->new(debug => $self->{debug});
+    
+    # Combine all text to check
+    my @text_parts;
+    push @text_parts, $context->{discussion}{title} || '';
+    push @text_parts, $context->{discussion}{body} || '';
+    
+    for my $comment (@{$context->{comments} || []}) {
+        push @text_parts, $comment->{body} || '';
+    }
+    
+    my $full_text = join("\n\n", @text_parts);
+    
+    return $guard->check($full_text);
 }
 
 =head2 _log

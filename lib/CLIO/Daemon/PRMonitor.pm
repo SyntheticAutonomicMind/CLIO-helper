@@ -325,7 +325,26 @@ sub _review_pr {
     
     # Build context
     my $context = $self->_build_pr_context($owner, $name, $pr);
-    
+
+    # Pre-filter with programmatic guardrails
+    my $guardrail_result = $self->_check_guardrails($context);
+    if ($guardrail_result->{action} ne 'proceed') {
+        $self->_log("INFO", "Guardrails triggered for PR #$number: $guardrail_result->{action}");
+        $self->_log("DEBUG", "Flags: " . join(', ', @{$guardrail_result->{flags}}));
+
+        if ($guardrail_result->{action} eq 'moderate') {
+            # High-severity: skip review entirely and alert maintainers
+            $self->_log("WARN", "PR #$number blocked by guardrails: " .
+                join(', ', @{$guardrail_result->{flags}}));
+            $self->{state}->record_check($pr_id, "guardrail:blocked");
+            $self->_restore_branch();
+            return;
+        } elsif ($guardrail_result->{action} eq 'flag') {
+            # Medium-severity: proceed with caution, log the flags
+            $self->_log("INFO", "PR #$number flagged by guardrails - proceeding with caution");
+        }
+    }
+
     # Add re-review context if present
     if ($re_review_context && length($re_review_context)) {
         $context->{re_review} = 1;
@@ -616,6 +635,11 @@ sub _sync_repo {
     $repos_dir =~ s/^~/$ENV{HOME}/;
     return '' unless $repos_dir;
     
+    # Sanitize for shell interpolation
+    my $s_repos_dir = _safe_shell_arg($repos_dir);
+    my $s_owner     = _safe_shell_arg($owner);
+    my $s_name      = _safe_shell_arg($name);
+    
     # Create repos directory if needed
     unless (-d $repos_dir) {
         require File::Path;
@@ -624,17 +648,18 @@ sub _sync_repo {
     }
     
     my $repo_path = "$repos_dir/$owner/$name";
+    my $s_repo_path = "$s_repos_dir/$s_owner/$s_name";
     
     if (-d "$repo_path/.git") {
         # Repo exists, fetch all branches and pull
         $self->_log("DEBUG", "Fetching latest for $owner/$name");
         local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
-        my $result = `cd "$repo_path" && git fetch --all 2>&1 && git pull 2>&1`;
+        my $result = `cd "$s_repo_path" && git fetch --all 2>&1 && git pull 2>&1`;
         my $exit_code = $? >> 8;
         if ($exit_code != 0) {
             $self->_log("WARN", "Git fetch/pull failed for $owner/$name: $result");
             # Try reset and pull
-            `cd "$repo_path" && git fetch origin && git reset --hard origin/HEAD 2>&1`;
+            `cd "$s_repo_path" && git fetch origin && git reset --hard origin/HEAD 2>&1`;
         }
     } else {
         # Clone the repo
@@ -643,8 +668,8 @@ sub _sync_repo {
         File::Path::mkpath("$repos_dir/$owner");
         
         local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
-        my $clone_url = "https://github.com/$owner/$name.git";
-        my $result = `git clone "$clone_url" "$repo_path" 2>&1`;
+        my $clone_url = "https://github.com/$s_owner/$s_name.git";
+        my $result = `git clone "$clone_url" "$s_repo_path" 2>&1`;
         my $exit_code = $? >> 8;
         
         if ($exit_code != 0) {
@@ -675,31 +700,44 @@ sub _checkout_pr_head {
     return '' unless $repo_path && -d $repo_path;
     return '' unless $head_sha;
     
+    # Sanitize for shell interpolation
+    my $s_repo_path = _safe_shell_arg($repo_path);
+    my $s_head_sha  = _safe_shell_arg($head_sha);
+    my $s_head_ref  = _safe_shell_arg($head_ref);
+    
     # Record the current branch so we can restore it
-    my $original_branch = `cd "$repo_path" && git rev-parse --abbrev-ref HEAD 2>/dev/null`;
+    my $original_branch = `cd "$s_repo_path" && git rev-parse --abbrev-ref HEAD 2>/dev/null`;
     chomp $original_branch;
-    $original_branch ||= 'main';
+    
+    # If we're in detached HEAD, capture the full SHA as restore point
+    if ($original_branch eq 'HEAD' || !$original_branch) {
+        my $original_sha = `cd "$s_repo_path" && git rev-parse HEAD 2>/dev/null`;
+        chomp $original_sha;
+        $original_branch = $original_sha || 'HEAD';
+    }
     
     # Fetch the PR head if it's from a fork
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
     
     if ($head_repo && $head_repo ne "$pr->{base}{repo}{full_name}") {
         # PR from a fork - fetch the head ref
-        my $head_owner = $pr->{head}{repo}{owner}{login} || '';
+        # Sanitize the clone URL from the GitHub API (untrusted input)
         my $head_clone_url = $pr->{head}{repo}{clone_url} || "https://github.com/$head_repo.git";
+        my $s_head_clone_url = _safe_shell_arg($head_clone_url);
         $self->_log("DEBUG", "Fetching PR head from fork: $head_repo");
-        `cd "$repo_path" && git fetch "$head_clone_url" "$head_ref" 2>&1`;
+        `cd "$s_repo_path" && git fetch "$s_head_clone_url" "$s_head_ref" 2>&1`;
     }
     
     # Checkout the head SHA
     $self->_log("DEBUG", "Checking out PR head: $head_sha");
-    my $result = `cd "$repo_path" && git checkout "$head_sha" 2>&1`;
+    my $result = `cd "$s_repo_path" && git checkout "$s_head_sha" 2>&1`;
     my $exit_code = $? >> 8;
     
     if ($exit_code != 0) {
         $self->_log("WARN", "Failed to checkout PR head $head_sha: $result");
-        # Try to restore original branch
-        `cd "$repo_path" && git checkout "$original_branch" 2>/dev/null`;
+        # Try to restore original branch/SHA
+        my $s_orig = _safe_shell_arg($original_branch);
+        `cd "$s_repo_path" && git checkout "$s_orig" 2>/dev/null`;
         return '';
     }
     
@@ -720,8 +758,11 @@ sub _restore_branch {
     
     return unless $repo_path && $original_branch && -d $repo_path;
     
-    $self->_log("DEBUG", "Restoring branch $original_branch in $repo_path");
-    `cd "$repo_path" && git checkout "$original_branch" 2>/dev/null`;
+    my $s_repo_path = _safe_shell_arg($repo_path);
+    my $s_orig = _safe_shell_arg($original_branch);
+    
+    $self->_log("DEBUG", "Restoring to $original_branch in $repo_path");
+    `cd "$s_repo_path" && git checkout "$s_orig" 2>/dev/null`;
 }
 
 =head2 _fetch_pr_diff
@@ -1039,6 +1080,34 @@ sub _post_review {
     } else {
         $self->_log("INFO", "Posted review on $owner/$name#$number");
     }
+}
+
+=head2 _check_guardrails
+
+Run programmatic guardrails on PR content before AI analysis.
+Checks title, body, and comments for prompt injection, social engineering,
+encoded content, and invisible character attacks.
+
+=cut
+
+sub _check_guardrails {
+    my ($self, $context) = @_;
+    
+    require CLIO::Daemon::Guardrails;
+    my $guard = CLIO::Daemon::Guardrails->new(debug => $self->{debug});
+    
+    # Combine all text to check
+    my @text_parts;
+    push @text_parts, $context->{discussion}{title} || '';
+    push @text_parts, $context->{discussion}{body} || '';
+    
+    for my $comment (@{$context->{comments} || []}) {
+        push @text_parts, $comment->{body} || '';
+    }
+    
+    my $full_text = join("\n\n", @text_parts);
+    
+    return $guard->check($full_text);
 }
 
 =head2 _log
