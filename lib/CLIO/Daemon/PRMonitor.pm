@@ -265,6 +265,8 @@ sub _poll_repo {
         if ($@) {
             $self->_log("ERROR", "Failed to review $owner/$name#$pr->{number}: $@");
             $self->{state}->record_check($pr_id, 'error');
+            # Restore branch on error too
+            $self->_restore_branch();
         }
     }
 }
@@ -336,6 +338,7 @@ sub _review_pr {
     unless ($result && $result->{action} && $result->{action} ne 'skip') {
         $self->_log("WARN", "No actionable result from analyzer for PR #$number");
         $self->{state}->record_check($pr_id, "no-result:sha:$head_sha");
+        $self->_restore_branch();
         return;
     }
     
@@ -366,6 +369,9 @@ sub _review_pr {
         $self->_log("WARN", "PR #$number analysis produced no review content, not recording as reviewed");
         $self->{state}->record_check($pr_id, "no-review-content:sha:$head_sha");
     }
+    
+    # Restore the repo to its original branch after review
+    $self->_restore_branch();
 }
 
 =head2 _extract_review_json
@@ -562,14 +568,11 @@ sub _build_pr_context {
         $files_summary .= "- $f->{filename} ($status, +$additions/-$deletions)\n";
     }
     
-    # Determine repo-specific path for code context
-    my $repos_dir = $self->{config}{repos_dir} || '';
-    $repos_dir =~ s/^~/$ENV{HOME}/;  # Expand tilde
-    my $repo_path = '';
-    if ($repos_dir && -d "$repos_dir/$owner/$name") {
-        $repo_path = "$repos_dir/$owner/$name";
-    } elsif ($repos_dir && -d "$repos_dir/$owner/" . lc($name)) {
-        $repo_path = "$repos_dir/$owner/" . lc($name);
+    # Sync repo and checkout PR branch for code context
+    my $repo_path = $self->_sync_repo($owner, $name);
+    my $original_branch = '';
+    if ($repo_path) {
+        $original_branch = $self->_checkout_pr_head($repo_path, $pr);
     }
     
     my $context = {
@@ -592,7 +595,133 @@ sub _build_pr_context {
         comments => $comments,
     };
     
+    # Store original branch for restoration after review
+    $self->{_original_branch} = $original_branch if $original_branch;
+    $self->{_repo_path}       = $repo_path if $repo_path;
+    
     return $context;
+}
+
+=head2 _sync_repo
+
+Clone or pull the repository for code context during reviews.
+Returns the local repo path on success, empty string on failure.
+
+=cut
+
+sub _sync_repo {
+    my ($self, $owner, $name) = @_;
+    
+    my $repos_dir = $self->{config}{repos_dir} || '';
+    $repos_dir =~ s/^~/$ENV{HOME}/;
+    return '' unless $repos_dir;
+    
+    # Create repos directory if needed
+    unless (-d $repos_dir) {
+        require File::Path;
+        File::Path::mkpath($repos_dir);
+        $self->_log("DEBUG", "Created repos directory: $repos_dir");
+    }
+    
+    my $repo_path = "$repos_dir/$owner/$name";
+    
+    if (-d "$repo_path/.git") {
+        # Repo exists, fetch all branches and pull
+        $self->_log("DEBUG", "Fetching latest for $owner/$name");
+        local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+        my $result = `cd "$repo_path" && git fetch --all 2>&1 && git pull 2>&1`;
+        my $exit_code = $? >> 8;
+        if ($exit_code != 0) {
+            $self->_log("WARN", "Git fetch/pull failed for $owner/$name: $result");
+            # Try reset and pull
+            `cd "$repo_path" && git fetch origin && git reset --hard origin/HEAD 2>&1`;
+        }
+    } else {
+        # Clone the repo
+        $self->_log("INFO", "Cloning $owner/$name for PR review context");
+        require File::Path;
+        File::Path::mkpath("$repos_dir/$owner");
+        
+        local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+        my $clone_url = "https://github.com/$owner/$name.git";
+        my $result = `git clone "$clone_url" "$repo_path" 2>&1`;
+        my $exit_code = $? >> 8;
+        
+        if ($exit_code != 0) {
+            $self->_log("WARN", "Git clone failed for $owner/$name: $result");
+            return '';
+        }
+        $self->_log("INFO", "Cloned $owner/$name to $repo_path");
+    }
+    
+    return (-d $repo_path) ? $repo_path : '';
+}
+
+=head2 _checkout_pr_head
+
+Checkout the PR's head commit so CLIO can read the actual source files.
+Returns the original branch name for later restoration.
+
+=cut
+
+sub _checkout_pr_head {
+    my ($self, $repo_path, $pr) = @_;
+    
+    my $head_sha = $pr->{head}{sha} || '';
+    my $head_ref = $pr->{head}{ref} || '';
+    my $head_repo = $pr->{head}{repo}{full_name} || '';
+    my $base_ref = $pr->{base}{ref} || 'main';
+    
+    return '' unless $repo_path && -d $repo_path;
+    return '' unless $head_sha;
+    
+    # Record the current branch so we can restore it
+    my $original_branch = `cd "$repo_path" && git rev-parse --abbrev-ref HEAD 2>/dev/null`;
+    chomp $original_branch;
+    $original_branch ||= 'main';
+    
+    # Fetch the PR head if it's from a fork
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+    
+    if ($head_repo && $head_repo ne "$pr->{base}{repo}{full_name}") {
+        # PR from a fork - fetch the head ref
+        my $head_owner = $pr->{head}{repo}{owner}{login} || '';
+        my $head_clone_url = $pr->{head}{repo}{clone_url} || "https://github.com/$head_repo.git";
+        $self->_log("DEBUG", "Fetching PR head from fork: $head_repo");
+        `cd "$repo_path" && git fetch "$head_clone_url" "$head_ref" 2>&1`;
+    }
+    
+    # Checkout the head SHA
+    $self->_log("DEBUG", "Checking out PR head: $head_sha");
+    my $result = `cd "$repo_path" && git checkout "$head_sha" 2>&1`;
+    my $exit_code = $? >> 8;
+    
+    if ($exit_code != 0) {
+        $self->_log("WARN", "Failed to checkout PR head $head_sha: $result");
+        # Try to restore original branch
+        `cd "$repo_path" && git checkout "$original_branch" 2>/dev/null`;
+        return '';
+    }
+    
+    return $original_branch;
+}
+
+=head2 _restore_branch
+
+Restore the repo to its original branch after review.
+
+=cut
+
+sub _restore_branch {
+    my ($self) = @_;
+    
+    my $repo_path = delete $self->{_repo_path} || '';
+    my $original_branch = delete $self->{_original_branch} || '';
+    
+    return unless $repo_path && $original_branch && -d $repo_path;
+    
+    $self->_log("DEBUG", "Restoring branch $original_branch in $repo_path");
+    `cd "$repo_path" && git checkout "$original_branch" 2>/dev/null`;
 }
 
 =head2 _fetch_pr_diff

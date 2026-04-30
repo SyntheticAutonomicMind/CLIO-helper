@@ -437,7 +437,7 @@ sub _run_clio {
     # Note: stderr is discarded to avoid debug output corrupting JSON extraction
     my $s_clio  = _safe_shell_arg($clio);
     my $s_model = _safe_shell_arg($model);
-    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new --model "$s_model" --no-custom-instructions --no-ltm --exit 2>/dev/null};
+    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new --model "$s_model" --exit 2>/dev/null};
     
     $self->_log("DEBUG", "Running CLIO analysis...");
     
