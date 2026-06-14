@@ -10,6 +10,24 @@ binmode(STDERR, ':encoding(UTF-8)');
 use Carp qw(croak);
 use JSON::PP qw(encode_json decode_json);
 use POSIX qw(strftime);
+use CLIO::Daemon::GH;
+
+=head2 _gh_run
+
+Run a gh CLI subcommand with stderr captured. Returns 1 on success, 0 on
+failure. Centralised so failures (e.g. bot lacks permission to add labels
+or close issues) do not pollute the log with gh's raw error output.
+
+=cut
+
+sub _gh_run {
+    my ($self, @args) = @_;
+    my $logger = sub {
+        my ($level, $msg) = @_;
+        $self->_log($level, $msg);
+    };
+    return $self->{gh}->run([@args], logger => $logger);
+}
 
 =head2 _safe_shell_arg
 
@@ -59,6 +77,7 @@ sub new {
         config   => $args{config} || croak("config required"),
         state    => $args{state}  || croak("state required"),
         debug    => $args{debug}  || 0,
+        gh       => CLIO::Daemon::GH->new(debug => $args{debug} || 0),
         gh_token => $args{config}{github_token} || $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
     };
     
@@ -266,12 +285,22 @@ sub _close_stale_issue {
     $comment .= "_This is an automated action._\n";
     
     $self->_post_comment($owner, $name, $number, $comment);
-    
-    unless ($self->{config}{dry_run}) {
-        local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
-        system('gh', 'issue', 'close', '--repo', "$owner/$name", "$number", '--reason', 'not planned');
+
+    if ($self->{config}{dry_run}) {
+        $self->_log("DRY-RUN", "Would close stale issue $owner/$name#$number");
+        return;
     }
-    
+
+    local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
+
+    # Best-effort close. The bot may lack close permission on some repos;
+    # the warning comment was already posted, so the user/maintainer can
+    # close manually.
+    my $ok = $self->_gh_run('issue', 'close', '--repo', "$owner/$name", "$number", '--reason', 'not planned');
+    if (!$ok) {
+        $self->_log("WARN", "Could not close stale issue (bot may lack close permission - warning was still posted)");
+    }
+
     $self->_log("INFO", "Closed stale issue $owner/$name#$number ($days days)");
 }
 
@@ -316,8 +345,11 @@ sub _post_comment {
     my ($fh, $tmpfile) = File::Temp::tempfile(UNLINK => 1);
     print $fh $body;
     close $fh;
-    
-    system('gh', 'issue', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
+
+    my $ok = $self->_gh_run('issue', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
+    if (!$ok) {
+        $self->_log("ERROR", "Failed to post comment on $owner/$name#$number");
+    }
 }
 
 =head2 _add_label
@@ -328,14 +360,18 @@ Add a label to an issue.
 
 sub _add_label {
     my ($self, $owner, $name, $number, $label) = @_;
-    
+
     return if $self->{config}{dry_run};
-    
+
     local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
-    
-    my $s_label = _safe_shell_arg($label);
-    system('gh', 'label', 'create', '--repo', "$owner/$name", $s_label, '--color', 'fef2c0');
-    system('gh', 'issue', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $s_label);
+
+    # Best-effort label create + add. The bot may lack label permissions on
+    # this repo; log a single warning and move on.
+    $self->_gh_run('label', 'create', '--repo', "$owner/$name", $label, '--color', 'fef2c0');
+    my $ok = $self->_gh_run('issue', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $label);
+    if (!$ok) {
+        $self->_log("WARN", "Could not add label '$label' (bot may lack label permission)");
+    }
 }
 
 =head2 _parse_date

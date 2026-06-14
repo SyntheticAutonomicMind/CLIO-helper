@@ -12,6 +12,24 @@ use JSON::PP qw(encode_json decode_json);
 use File::Spec;
 use POSIX qw(strftime);
 use FindBin;
+use CLIO::Daemon::GH;
+
+=head2 _gh_run
+
+Run a gh CLI subcommand with stderr captured. Returns 1 on success, 0 on
+failure. Centralised so failures (e.g. bot lacks permission to add labels or
+close issues) do not pollute the log with gh's raw error output.
+
+=cut
+
+sub _gh_run {
+    my ($self, @args) = @_;
+    my $logger = sub {
+        my ($level, $msg) = @_;
+        $self->_log($level, $msg);
+    };
+    return $self->{gh}->run([@args], logger => $logger);
+}
 
 =head2 _safe_shell_arg
 
@@ -61,12 +79,13 @@ Features:
 
 sub new {
     my ($class, %args) = @_;
-    
+
     my $self = {
         config    => $args{config} || croak("config required"),
         state     => $args{state}  || croak("state required"),
         debug     => $args{debug}  || 0,
         analyzer  => undef,
+        gh        => CLIO::Daemon::GH->new(debug => $args{debug} || 0),
         gh_token  => $args{config}{github_token} || $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
     };
     
@@ -379,8 +398,11 @@ sub _triage_issue {
     my $triage = $result->{triage} || $self->_extract_triage_json($result);
     
     if ($triage) {
+        # Pass current labels so apply_triage only removes labels that exist
+        my @current_labels = map { ref($_) ? $_->{name} : $_ } @{$issue->{labels} || []};
+
         # Apply triage results
-        $self->_apply_triage($owner, $name, $number, $triage);
+        $self->_apply_triage($owner, $name, $number, $triage, \@current_labels);
     } else {
         $self->_log("WARN", "Could not extract triage JSON for #$number");
     }
@@ -639,56 +661,45 @@ sub _extract_triage_json {
 
 =head2 _apply_triage
 
-Apply triage results: labels, assignment, comment.
+Apply triage results: labels, assignment, comment. All side-effect operations
+are best-effort - if the bot lacks permission to add labels, close issues, or
+assign, the failure is logged once and the rest of the triage proceeds. The
+triage comment is always posted because it is the primary deliverable.
+
+$current_labels is a listref of label names already on the issue. It is used
+to avoid trying to remove priority labels that were never applied (which
+would error with "label not found" and spam the log).
 
 =cut
 
 sub _apply_triage {
-    my ($self, $owner, $name, $number, $triage) = @_;
-    
-    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
-    
+    my ($self, $owner, $name, $number, $triage, $current_labels) = @_;
+
     my $dry_run = $self->{config}{dry_run};
-    my $posting_token = $self->{config}{posting_token};
-    local $ENV{GH_TOKEN} = $posting_token if $posting_token;
-    
-    # Apply labels
+
+    # Set GH_TOKEN to the posting bot token (may differ from github_token).
+    if (!$dry_run) {
+        my $posting_token = $self->{config}{posting_token} || $self->{gh_token};
+        local $ENV{GH_TOKEN} = $posting_token if $posting_token;
+    }
+
+    # Apply labels (best-effort)
     my @labels = @{$triage->{labels} || []};
     if (@labels) {
-        # Remove old priority labels first
-        for my $old_label (qw(priority:critical priority:high priority:medium priority:low)) {
-            if (!$dry_run) {
-                system('gh', 'issue', 'edit', '--repo', "$owner/$name", "$number", '--remove-label', $old_label);
-            }
-        }
-        
-        for my $label (@labels) {
-            $label =~ s/^\s+|\s+$//g;
-            next unless $label;
-            
-            $self->_log("INFO", "  Adding label: $label");
-            unless ($dry_run) {
-                # Create label if it doesn't exist, then apply
-                my $s_label = _safe_shell_arg($label);
-                system('gh', 'label', 'create', '--repo', "$owner/$name", $s_label, '--color', 'c5def5');
-                system('gh', 'issue', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $s_label);
-            }
-        }
+        $self->_apply_labels($owner, $name, $number, $current_labels || [], \@labels);
     }
-    
-    # Assign
+
+    # Assign (best-effort). Skipped for close recommendations since the
+    # issue is going away.
     my $assign_to = $triage->{assign_to};
-    if ($assign_to && $triage->{recommendation} ne 'close') {
-        $self->_log("INFO", "  Assigning to: $assign_to");
-        unless ($dry_run) {
-            my $s_assign = _safe_shell_arg($assign_to);
-            system('gh', 'issue', 'edit', '--repo', "$owner/$name", "$number", '--add-assignee', $s_assign);
-        }
+    if ($assign_to && ($triage->{recommendation} || '') ne 'close') {
+        $self->_assign_issue($owner, $name, $number, $assign_to);
     }
-    
-    # Post comment based on recommendation
+
+    # Post comment based on recommendation - this is the primary deliverable
+    # and runs even if label/assign/close steps above failed.
     my $rec = $triage->{recommendation} || 'ready-for-review';
-    
+
     if ($rec eq 'close') {
         $self->_post_close_comment($owner, $name, $number, $triage);
     } elsif ($rec eq 'needs-info') {
@@ -697,6 +708,99 @@ sub _apply_triage {
         $self->_post_addressed_comment($owner, $name, $number, $triage);
     } else {
         $self->_post_triage_comment($owner, $name, $number, $triage);
+    }
+}
+
+=head2 _apply_labels
+
+Apply triage labels to an issue. Best-effort: removes priority labels that
+are actually on the issue, then tries to add each new label. Each step logs
+a single warning on failure and continues.
+
+Returns nothing meaningful - callers should not depend on the result.
+
+=cut
+
+sub _apply_labels {
+    my ($self, $owner, $name, $number, $current_labels, $labels) = @_;
+
+    my $dry_run = $self->{config}{dry_run};
+
+    # Build the set of currently-applied label names for fast lookup
+    my %current_set = map { $_ => 1 } @$current_labels;
+
+    # Build the set of new labels (after trimming whitespace, dropping blanks)
+    my @clean_labels = grep { defined && s/^\s+|\s+$//g && length } @$labels;
+    my %new_set = map { $_ => 1 } @clean_labels;
+
+    # Remove old CLIO priority labels that are on the issue but not in the
+    # new set. We only remove labels that actually exist to avoid the
+    # "label not found" error that previously spammed the log.
+    my @priority_labels = qw(priority:critical priority:high priority:medium priority:low);
+    for my $old_label (@priority_labels) {
+        next unless $current_set{$old_label};
+        next if $new_set{$old_label};  # same label is being reapplied
+
+        if ($dry_run) {
+            $self->_log("DRY-RUN", "Would remove label: $old_label");
+            next;
+        }
+
+        my $ok = $self->_gh_run('issue', 'edit', '--repo', "$owner/$name", "$number", '--remove-label', $old_label);
+        if ($ok) {
+            $self->_log("DEBUG", "Removed label: $old_label");
+        } else {
+            $self->_log("WARN", "Could not remove label '$old_label' (continuing)");
+        }
+    }
+
+    # Add each new label (best-effort)
+    for my $label (@clean_labels) {
+        if ($current_set{$label}) {
+            $self->_log("DEBUG", "Label '$label' already on issue, skipping");
+            next;
+        }
+
+        $self->_log("INFO", "  Adding label: $label");
+
+        if ($dry_run) {
+            next;
+        }
+
+        # Try to create the label in the repo. This may fail with 403/404 if
+        # the bot lacks label-creation permission; that's fine, the next
+        # step will report whether the label can be added.
+        $self->_gh_run('label', 'create', '--repo', "$owner/$name", $label, '--color', 'c5def5');
+
+        # Try to add the label. The bot may lack AddLabelsToLabelable
+        # permission (e.g. on repos where it only has comment access).
+        my $ok = $self->_gh_run('issue', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $label);
+        if (!$ok) {
+            $self->_log("WARN", "Could not add label '$label' (bot may lack label permission - triage comment was still posted)");
+        }
+    }
+}
+
+=head2 _assign_issue
+
+Assign an issue to a user. Best-effort: logs a warning on failure.
+
+=cut
+
+sub _assign_issue {
+    my ($self, $owner, $name, $number, $assignee) = @_;
+
+    my $dry_run = $self->{config}{dry_run};
+
+    $self->_log("INFO", "  Assigning to: $assignee");
+
+    if ($dry_run) {
+        return;
+    }
+
+    my $ok = $self->_gh_run('issue', 'edit', '--repo', "$owner/$name", "$number", '--add-assignee', $assignee);
+    if (!$ok) {
+        $self->_log("WARN", "Could not assign to '$assignee' (bot may lack assignment permission)");
     }
 }
 
@@ -784,10 +888,18 @@ sub _post_close_comment {
     $comment .= "If you believe this is incorrect, please reopen the issue with additional information.\n";
     
     $self->_post_comment($owner, $name, $number, $comment);
-    
-    unless ($self->{config}{dry_run}) {
-        local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
-        system('gh', 'issue', 'close', '--repo', "$owner/$name", "$number", '--reason', 'not planned');
+
+    if ($self->{config}{dry_run}) {
+        $self->_log("DRY-RUN", "Would close issue");
+        return;
+    }
+
+    # Best-effort close. The bot may lack the closeIssue GraphQL permission
+    # on some repos; in that case the comment is still posted and a
+    # maintainer can close manually.
+    my $ok = $self->_gh_run('issue', 'close', '--repo', "$owner/$name", "$number", '--reason', 'not planned');
+    if (!$ok) {
+        $self->_log("WARN", "Could not close issue (bot may lack close permission - triage comment was still posted)");
     }
 }
 
@@ -810,11 +922,19 @@ sub _post_needs_info_comment {
     $comment .= "Once you've added this information, the issue will be re-evaluated.\n";
     
     $self->_post_comment($owner, $name, $number, $comment);
-    
-    unless ($self->{config}{dry_run}) {
-        local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
-        system('gh', 'label', 'create', '--repo', "$owner/$name", 'needs-info', '--color', 'd876e3');
-        system('gh', 'issue', 'edit', '--repo', "$owner/$name", "$number", '--add-label', 'needs-info');
+
+    if ($self->{config}{dry_run}) {
+        $self->_log("DRY-RUN", "Would add needs-info label");
+        return;
+    }
+
+    # Best-effort needs-info label. The bot may not be able to create
+    # the label in this repo or add it to the issue; log a single
+    # warning and move on.
+    $self->_gh_run('label', 'create', '--repo', "$owner/$name", 'needs-info', '--color', 'd876e3');
+    my $ok = $self->_gh_run('issue', 'edit', '--repo', "$owner/$name", "$number", '--add-label', 'needs-info');
+    if (!$ok) {
+        $self->_log("WARN", "Could not add 'needs-info' label (continuing - triage comment was still posted)");
     }
 }
 
@@ -857,13 +977,13 @@ sub _post_comment {
     my ($fh, $tmpfile) = File::Temp::tempfile(UNLINK => 1);
     print $fh $body;
     close $fh;
-    
-    my $result = system('gh', 'issue', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
-    
-    if ($result != 0) {
-        $self->_log("ERROR", "Failed to post comment on $owner/$name#$number");
-    } else {
+
+    my $ok = $self->_gh_run('issue', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
+
+    if ($ok) {
         $self->_log("INFO", "Posted triage comment on $owner/$name#$number");
+    } else {
+        $self->_log("ERROR", "Failed to post comment on $owner/$name#$number");
     }
 }
 

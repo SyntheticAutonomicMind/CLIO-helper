@@ -12,6 +12,24 @@ use JSON::PP qw(encode_json decode_json);
 use File::Spec;
 use POSIX qw(strftime);
 use FindBin;
+use CLIO::Daemon::GH;
+
+=head2 _gh_run
+
+Run a gh CLI subcommand with stderr captured. Returns 1 on success, 0 on
+failure. Centralised so failures (e.g. bot lacks label permission) do not
+pollute the log with gh's raw error output.
+
+=cut
+
+sub _gh_run {
+    my ($self, @args) = @_;
+    my $logger = sub {
+        my ($level, $msg) = @_;
+        $self->_log($level, $msg);
+    };
+    return $self->{gh}->run([@args], logger => $logger);
+}
 
 =head2 _safe_shell_arg
 
@@ -66,6 +84,7 @@ sub new {
         state     => $args{state}  || croak("state required"),
         debug     => $args{debug}  || 0,
         analyzer  => undef,
+        gh        => CLIO::Daemon::GH->new(debug => $args{debug} || 0),
         gh_token  => $args{config}{github_token} || $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
     };
     
@@ -541,20 +560,26 @@ Apply labels to a PR.
 
 sub _apply_labels {
     my ($self, $owner, $name, $number, $labels) = @_;
-    
+
     return unless @$labels;
     return if $self->{config}{dry_run};
-    
+
     local $ENV{GH_TOKEN} = $self->{config}{posting_token} || $self->{gh_token};
-    
+
     for my $label (@$labels) {
         $label =~ s/^\s+|\s+$//g;
         next unless $label;
-        
+
         $self->_log("INFO", "  Adding label: $label");
-        my $s_label = _safe_shell_arg($label);
-        system('gh', 'label', 'create', '--repo', "$owner/$name", $s_label, '--color', 'c5def5');
-        system('gh', 'pr', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $s_label);
+
+        # Best-effort label creation + application. Failures (e.g. bot
+        # lacks label permission) are logged as a single warning and the
+        # rest of the label list continues.
+        $self->_gh_run('label', 'create', '--repo', "$owner/$name", $label, '--color', 'c5def5');
+        my $ok = $self->_gh_run('pr', 'edit', '--repo', "$owner/$name", "$number", '--add-label', $label);
+        if (!$ok) {
+            $self->_log("WARN", "Could not add label '$label' to PR (bot may lack label permission)");
+        }
     }
 }
 
@@ -1073,12 +1098,12 @@ sub _post_review {
     print $fh $body;
     close $fh;
     
-    my $result = system('gh', 'pr', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
-    
-    if ($result != 0) {
-        $self->_log("ERROR", "Failed to post review on $owner/$name#$number");
-    } else {
+    my $ok = $self->_gh_run('pr', 'comment', '--repo', "$owner/$name", "$number", '--body-file', $tmpfile);
+
+    if ($ok) {
         $self->_log("INFO", "Posted review on $owner/$name#$number");
+    } else {
+        $self->_log("ERROR", "Failed to post review on $owner/$name#$number");
     }
 }
 

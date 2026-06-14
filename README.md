@@ -335,6 +335,27 @@ If using a separate `posting_token` for a bot account, that token also needs `re
 
 > **Tip:** Use a [fine-grained personal access token](https://github.com/settings/tokens?type=beta) scoped to only the repositories you want to monitor.
 
+### Bot Permissions and Graceful Degradation
+
+The bot account backing `posting_token` (or `github_token` if you do not split tokens) needs certain permissions to apply labels, close issues, and assign reviewers. The required permissions depend on what features you want enabled:
+
+| Feature | Permission Required | Fine-Grained Token Setting |
+|---------|--------------------|-----------------------------|
+| Post comments | Issues: Read+Write, Discussions: Read+Write | `Issues: Write`, `Metadata: Read` |
+| Add/remove labels | Issues: Write (and `Metadata: Write` for creating new labels) | `Issues: Write` |
+| Close issues (spam, invalid) | Issues: Write | `Issues: Write` |
+| Close PRs (stale) | Pull Requests: Write | `Pull Requests: Write` |
+| Assign issues / request PR review | Issues: Write, Pull Requests: Write | `Issues: Write`, `Pull Requests: Write` |
+| Create new label definitions | Repository administration: Write | `Administration: Write` |
+
+The daemon **degrades gracefully** when the bot lacks a permission. If the bot cannot add a label, close an issue, or assign a reviewer, the failure is logged as a single warning and the rest of the triage continues. The triage comment is always posted because it is the primary deliverable.
+
+In practice this means:
+
+- A bot with comment-only access still produces useful triage comments - labels and closes just get skipped.
+- A bot with `repo` scope (classic PAT) has full functionality on every monitor.
+- A fine-grained token scoped to a single repo can be given full functionality by granting `Issues: Read+Write`, `Pull Requests: Read+Write`, and `Metadata: Read`. Add `Administration: Write` only if you want the bot to create new label definitions.
+
 ## Security and Guardrails
 
 CLIO-helper includes multiple layers of abuse protection.
