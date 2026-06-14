@@ -298,12 +298,42 @@ Get the local path to a cloned repository.
 
 sub _get_repo_path {
     my ($self, $owner, $repo) = @_;
-    
+
     my $repos_dir = $self->{config}{repos_dir};
     $repos_dir =~ s/^~/$ENV{HOME}/;
-    
+
     my $path = "$repos_dir/$owner/$repo";
     return (-d $path) ? $path : undef;
+}
+
+=head2 _build_placeholders
+
+Return the hashref of {{KEY}} substitutions to apply to prompt templates.
+Reads values from config, falling back to sensible defaults so a missing
+config value does not break the analyzer.
+
+=cut
+
+sub _build_placeholders {
+    my ($self) = @_;
+
+    my $cfg = $self->{config} || {};
+    my $bot = $cfg->{bot_username} || 'CLIO-Bot';
+    my $org = $cfg->{org_name} || ($self->_detect_org_name() || 'this organization');
+    my $signature = $cfg->{bot_signature} || "- $bot";
+
+    return {
+        ORG_NAME      => $org,
+        BOT_NAME      => $bot,
+        BOT_SIGNATURE => $signature,
+    };
+}
+
+sub _detect_org_name {
+    my ($self) = @_;
+    my $repos = $self->{config}{repos} || [];
+    return '' unless @$repos;
+    return $repos->[0]{owner} || '';
 }
 
 =head2 run
@@ -796,10 +826,11 @@ sub _process_item {
     # Use CLIO AI to analyze and generate response
     require CLIO::Daemon::Analyzer;
     my $analyzer = CLIO::Daemon::Analyzer->new(
-        model       => $self->{config}{model},
-        debug       => $self->{debug},
-        repos_path  => $repo_path,  # Pass repo path for code context
-        prompts_dir => $self->{config}{prompts_dir},  # Custom prompts directory
+        model        => $self->{config}{model},
+        debug        => $self->{debug},
+        repos_path   => $repo_path,  # Pass repo path for code context
+        prompts_dir  => $self->{config}{prompts_dir},  # Custom prompts directory
+        placeholders => $self->_build_placeholders(),
     );
     
     my $analysis = $analyzer->analyze($context);

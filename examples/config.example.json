@@ -44,5 +44,12 @@
     "stale_pr_warning_days": 14,
 
     "auto_update_clio": true,
-    "update_check_hours": 4
+    "update_check_hours": 4,
+
+    "_prompt_placeholders": {
+        "comment": "These values substitute {{ORG_NAME}}, {{BOT_NAME}}, and {{BOT_SIGNATURE}} in bundled prompts. Defaults are derived from the first configured repo's owner field and the bot_username config.",
+        "org_name": "SyntheticAutonomicMind",
+        "bot_username": "CLIO-Bot",
+        "bot_signature": "- CLIO"
+    }
 }

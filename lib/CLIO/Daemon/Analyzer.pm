@@ -68,7 +68,7 @@ Arguments (hash):
 
 sub new {
     my ($class, %args) = @_;
-    
+
     my $self = {
         model         => $args{model} || 'minimax/MiniMax-M2.7',
         debug         => $args{debug} || 0,
@@ -76,8 +76,9 @@ sub new {
         repos_path    => $args{repos_path} || '',   # Path to cloned repos for context
         prompt_file   => $args{prompt_file} || '',  # Custom prompt file (full path)
         prompts_dir   => $args{prompts_dir} || '',  # Directory containing prompt files
+        placeholders  => $args{placeholders} || {},  # {{KEY}} -> value substitutions
     };
-    
+
     bless $self, $class;
     return $self;
 }
@@ -247,27 +248,30 @@ sub _build_pr_prompt {
 
 =head2 _load_prompt_file
 
-Load prompt from external file if configured.
+Load prompt from external file if configured. After loading, applies
+`{{KEY}}` placeholder substitution using the values provided to
+`new(placeholders => ...)`. Unknown placeholders are left as-is so a
+missing config value does not break analysis.
 
 =cut
 
 sub _load_prompt_file {
     my ($self) = @_;
-    
+
     # Check for specific prompt file
     my $file = $self->{prompt_file};
-    
+
     # Or look in prompts directory
     unless ($file && -f $file) {
         if ($self->{prompts_dir} && -d $self->{prompts_dir}) {
             $file = "$self->{prompts_dir}/analyzer-default.md";
         }
     }
-    
+
     return '' unless $file && -f $file;
-    
+
     $self->_log("DEBUG", "Loading prompt from: $file");
-    
+
     my $content;
     eval {
         open my $fh, '<:encoding(UTF-8)', $file or die "Cannot open $file: $!";
@@ -279,8 +283,31 @@ sub _load_prompt_file {
         $self->_log("WARN", "Failed to load prompt file: $@");
         return '';
     }
-    
-    return $content;
+
+    return $self->_substitute_placeholders($content);
+}
+
+=head2 _substitute_placeholders
+
+Replace `{{KEY}}` tokens in $text with values from `$self->{placeholders}`.
+Unknown placeholders are left untouched so missing config does not silently
+break analysis (the AI will see `{{ORG_NAME}}` and ask if it matters, which
+is the right behaviour for a missing-config signal).
+
+=cut
+
+sub _substitute_placeholders {
+    my ($self, $text) = @_;
+    return $text unless defined $text && length $text;
+
+    my $ph = $self->{placeholders} || {};
+    return $text unless %$ph;
+
+    $text =~ s/\{\{\s*([A-Z][A-Z0-9_]*)\s*\}\}/
+        exists $ph->{$1} ? $ph->{$1} : "{{$1}}"
+    /ge;
+
+    return $text;
 }
 
 =head2 _default_prompt

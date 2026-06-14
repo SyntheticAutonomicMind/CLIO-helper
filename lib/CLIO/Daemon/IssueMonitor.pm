@@ -118,17 +118,57 @@ Initialize the CLIO Analyzer for issue triage.
 
 sub _init_analyzer {
     my ($self) = @_;
-    
+
     require CLIO::Daemon::Analyzer;
-    
+
     $self->{analyzer} = CLIO::Daemon::Analyzer->new(
-        model       => $self->{config}{model} || 'minimax/MiniMax-M2.7',
-        debug       => $self->{debug},
-        clio_path   => $self->{config}{clio_path} || 'clio',
-        repos_path  => $self->{config}{repos_dir} || '',
-        prompts_dir => $self->{config}{prompts_dir} || '',
-        prompt_file => $self->_get_prompt_file(),
+        model         => $self->{config}{model} || 'minimax/MiniMax-M2.7',
+        debug         => $self->{debug},
+        clio_path     => $self->{config}{clio_path} || 'clio',
+        repos_path    => $self->{config}{repos_dir} || '',
+        prompts_dir   => $self->{config}{prompts_dir} || '',
+        prompt_file   => $self->_get_prompt_file(),
+        placeholders  => $self->_build_placeholders(),
     );
+}
+
+=head2 _build_placeholders
+
+Return the hashref of {{KEY}} substitutions to apply to prompt templates.
+Reads values from config, falling back to sensible defaults so a missing
+config value does not break the analyzer. Callers can pass this directly
+to `CLIO::Daemon::Analyzer->new(placeholders => ...)`.
+
+=cut
+
+sub _build_placeholders {
+    my ($self) = @_;
+
+    my $cfg = $self->{config} || {};
+    my $bot = $cfg->{bot_username} || 'CLIO-Bot';
+    my $org = $cfg->{org_name} || ($self->_detect_org_name() || 'this organization');
+    my $signature = $cfg->{bot_signature} || "- $bot";
+
+    return {
+        ORG_NAME     => $org,
+        BOT_NAME     => $bot,
+        BOT_SIGNATURE => $signature,
+        REPO         => $cfg->{_placeholder_repo} || '',  # filled per-call if needed
+    };
+}
+
+=head2 _detect_org_name
+
+Best-effort org name detection from the first configured repo. Used as a
+fallback when `org_name` is not explicitly set in config.
+
+=cut
+
+sub _detect_org_name {
+    my ($self) = @_;
+    my $repos = $self->{config}{repos} || [];
+    return '' unless @$repos;
+    return $repos->[0]{owner} || '';
 }
 
 =head2 _get_prompt_file

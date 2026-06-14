@@ -406,7 +406,40 @@ CLIO-helper uses customizable prompt templates to control how the AI analyzes an
 | `prompts/analyzer-default.md` | Discussion Monitor | Main prompt for analyzing discussions and generating responses |
 | `prompts/issue-triage.md` | Issue Monitor | Deep triage: classification, root cause analysis, labeling |
 | `prompts/pr-review.md` | PR Monitor | Thorough code review: logic, style, security, file-level findings |
+| `prompts/pr-review-reference.md` | PR Monitor (reference) | Language-agnostic checklist for process-global state changes |
+| `prompts/pr-review-perl-reference.md` | PR Monitor (reference, Perl only) | Concrete Perl patterns for signal handlers, waitpid, fork |
 | `prompts/handoff-message.md` | Discussion Monitor | Message posted when response limit is reached for a thread |
+
+### Prompt Placeholders
+
+Bundled prompts are project-agnostic. They use `{{KEY}}` tokens that the
+daemon substitutes at load time from your config. Set them under
+`_prompt_placeholders` in `~/.clio/helper-config.json`:
+
+```json
+{
+    "_prompt_placeholders": {
+        "org_name": "MyOrg",
+        "bot_username": "my-org-bot",
+        "bot_signature": "- my-org-bot"
+    }
+}
+```
+
+| Placeholder | Default Source | Purpose |
+|-------------|---------------|---------|
+| `{{ORG_NAME}}` | First configured repo's `owner` field, or `org_name` config | GitHub org the bot is assisting |
+| `{{BOT_NAME}}` | `bot_username` config (auto-detected from the posting token) | The bot's GitHub login |
+| `{{BOT_SIGNATURE}}` | `bot_signature` config, or `- {{BOT_NAME}}` | Text appended to bot responses |
+
+If a placeholder is unset and no fallback applies, the token is left in
+the prompt (e.g. `{{ORG_NAME}}` shows up literally). This is intentional -
+a missing value is visible to the AI rather than silently breaking
+analysis, and is the signal that configuration needs attention.
+
+Whichever is in your prompt is also fine - if you write `- MyBot` directly
+in the template, the daemon does not touch it. Placeholders only fire for
+`{{UPPER_SNAKE_CASE}}` tokens.
 
 ### Using Custom Prompts
 
