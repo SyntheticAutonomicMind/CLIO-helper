@@ -64,6 +64,14 @@ Monitors new and updated issues and performs AI-powered triage with deep codebas
 - **Needs-info handling** - Requests specific missing information from reporters when issues are incomplete
 - **Auto-close** - Closes spam, prompt injection attempts, and invalid issues with explanation
 
+**Re-analysis on user follow-up:** When a user comments on an issue after the bot has already responded, the bot re-triages with the prior response in context. The follow-up comment is labeled "Follow-up Triage" rather than "Automated Triage Summary" so it reads as an update, not a duplicate. Two safety guards apply on re-analysis:
+
+1. **Persistent-issue guard.** If the user reports the issue is still happening (phrases like "still broken", "not fixed", "doesn't work", "still reproducible"), the bot downgrades any `already-addressed` recommendation to `ready-for-review` so a maintainer verifies the fix. This prevents the bot from confidently asserting a fix worked when the user explicitly says it didn't.
+
+2. **No-meaningful-change guard.** If the bot's new triage would restate the prior summary without adding information (Jaccard token similarity >= 0.65), the follow-up comment is suppressed to avoid duplicate posts.
+
+A per-issue cap (`max_responses_per_issue`, default 2) prevents the bot from cycling on a single issue indefinitely.
+
 **Triage Comment Format:**
 
 When an issue is triaged, CLIO posts a structured comment including:
@@ -79,6 +87,7 @@ When an issue is triaged, CLIO posts a structured comment including:
 | `monitors.issues` | `true` | Enable/disable this monitor |
 | `issue_cooldown_minutes` | 60 | Minimum time between re-triaging the same issue |
 | `issue_poll_limit` | 10 | Max issues to fetch per repo per cycle |
+| `max_responses_per_issue` | 2 | Max triage responses per issue before CLIO stops re-engaging (prevents duplicate-post cycles) |
 
 ---
 

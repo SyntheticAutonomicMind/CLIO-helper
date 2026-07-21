@@ -275,6 +275,7 @@ sub _load_config {
     # Issue-specific defaults
     $config->{issue_cooldown_minutes}   //= 60;
     $config->{issue_poll_limit}         //= 10;
+    $config->{max_responses_per_issue}  //= 2;
     
     # PR-specific defaults
     $config->{pr_cooldown_minutes}      //= 30;

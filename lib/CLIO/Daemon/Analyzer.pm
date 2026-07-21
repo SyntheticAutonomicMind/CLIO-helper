@@ -154,6 +154,23 @@ sub _build_discussion_prompt {
     $thread .= "### Original Post\n\n";
     $thread .= $disc->{body} . "\n\n";
 
+    # Re-analysis marker + prior CLIO response. When present, the
+    # RE-ANALYSIS PROTOCOL section in the loaded prompt instructs the model
+    # to engage with the prior response instead of producing a duplicate.
+    if ($context->{re_analysis}) {
+        $thread .= "### RE-ANALYSIS FLAG\n\n";
+        $thread .= "**This is a re-analysis.** CLIO has already posted a response to this issue. The re-analysis protocol in the prompt applies. Do not produce a duplicate of the prior response.\n\n";
+    }
+    if ($context->{prior_response} && length $context->{prior_response}) {
+        $thread .= "### Prior CLIO response\n\n";
+        # Truncate so a verbose prior summary doesn't dominate the prompt.
+        my $prior = $context->{prior_response};
+        if (length($prior) > 4000) {
+            $prior = substr($prior, 0, 4000) . "\n\n[... truncated for length ...]";
+        }
+        $thread .= $prior . "\n\n";
+    }
+
     if (@comments) {
         $thread .= "### Comments\n\n";
         for my $c (@comments) {

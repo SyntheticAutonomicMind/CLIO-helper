@@ -34,6 +34,7 @@
 
     "issue_cooldown_minutes": 60,
     "issue_poll_limit": 10,
+    "max_responses_per_issue": 2,
 
     "pr_cooldown_minutes": 30,
     "pr_poll_limit": 10,

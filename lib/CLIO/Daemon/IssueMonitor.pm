@@ -233,7 +233,11 @@ sub _poll_repo {
     
     for my $issue (@$issues) {
         my $issue_id = "issue:$owner/$name#$issue->{number}";
-        
+
+        # Reset per-issue flags. _re_analysis is set later if we've already
+        # posted to this issue and new user activity is detected.
+        $self->{_re_analysis} = 0;
+
         # Skip if already has classification labels
         if ($self->_has_triage_labels($issue)) {
             $self->_log("DEBUG", "Skipping issue #$issue->{number} (already triaged)");
@@ -259,15 +263,27 @@ sub _poll_repo {
                 $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, cooldown ${age}s)");
                 next;
             }
-            
+
+            # Cap: don't re-triage beyond max_responses_per_issue. Prevents
+            # the bot from posting another near-duplicate analysis when
+            # the conversation keeps cycling (see fewtarius/llama-ai#9).
+            my $max_responses = $self->{config}{max_responses_per_issue} || 2;
+            my $response_count = $self->{state}->get_response_count($issue_id);
+            if ($response_count >= $max_responses) {
+                $self->_log("INFO", "Skipping issue #$issue->{number} (cap reached: $response_count/$max_responses responses)");
+                $self->{state}->record_check($issue_id, 'skip-response-cap');
+                next;
+            }
+
             # Cooldown passed - but only re-process if there's new user activity
             if (!$self->_has_new_user_comments($owner, $name, $issue->{number}, $last_response_time)) {
                 $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, no new user activity)");
                 $self->{state}->record_check($issue_id, 'skip-already-responded');
                 next;
             }
-            
+
             $self->_log("INFO", "Re-checking issue #$issue->{number} (new user activity since our response)");
+            $self->{_re_analysis} = 1;  # signal _build_issue_context / _triage_issue
         }
         
         # Skip if recently checked (even without responding - prevents rapid re-checks)
@@ -432,11 +448,47 @@ sub _triage_issue {
     }
     
     $self->_log("INFO", "Triage result for #$number: $result->{action}");
-    
+
     # Get triage data - prefer the structured triage from Analyzer,
     # fall back to extracting from the raw message
     my $triage = $result->{triage} || $self->_extract_triage_json($result);
-    
+
+    # Programmatic override: if this is a re-analysis and the user has
+    # reported the issue is still broken since the prior bot response, do
+    # NOT post `already-addressed` regardless of what the AI returned.
+    # This is the bug behind fewtarius/llama-ai#8 where the bot confidently
+    # asserted a fix existed despite the user explicitly saying it didn't.
+    if ($triage && ($triage->{recommendation} || '') eq 'already-addressed'
+        && $self->{_re_analysis}) {
+        my $user_says_persists = $self->_detect_persistent_issue_language(
+            $context->{comments} || []
+        );
+        if ($user_says_persists) {
+            $self->_log("INFO", "Overriding already-addressed -> ready-for-review: user reports persistence");
+            $triage->{recommendation} = 'ready-for-review';
+            $triage->{summary} = (
+                'The reporter says this issue is still occurring after the '
+              . 'linked fix. Downgrading from `already-addressed` to '
+              . '`ready-for-review` so a maintainer can verify. '
+              . '(Automated override based on persistence signal in recent user comments.) '
+            );
+        }
+    }
+
+    # No-meaningful-change guard: if this is a re-analysis and the AI's
+    # new triage would be substantively identical to the prior response,
+    # skip posting to avoid the duplicate-comment problem from
+    # fewtarius/llama-ai#9.
+    if ($triage && $self->{_re_analysis} && $context->{prior_response}) {
+        if ($self->_is_substantively_same($triage, $context->{prior_response})) {
+            $self->_log("INFO", "Skipping follow-up comment: no substantive change from prior response");
+            $self->{state}->record_check($issue_id, 'skip-no-change');
+            # Still record that we processed it so we don't keep retrying.
+            $self->{state}->record_response($issue_id, 'skip', 'no substantive change');
+            return;
+        }
+    }
+
     if ($triage) {
         # Pass current labels so apply_triage only removes labels that exist
         my @current_labels = map { ref($_) ? $_->{name} : $_ } @{$issue->{labels} || []};
@@ -458,19 +510,19 @@ Build analysis context for an issue (similar to workflow ISSUE_INFO.md).
 
 sub _build_issue_context {
     my ($self, $owner, $name, $issue) = @_;
-    
+
     my $number = $issue->{number};
-    
+
     # Fetch comments
     my $comments = $self->_fetch_issue_comments($owner, $name, $number);
-    
+
     # Fetch timeline events
     my $events = $self->_fetch_issue_events($owner, $name, $number);
-    
+
     # Build current labels string
     my @label_names = map { ref($_) ? $_->{name} : $_ } @{$issue->{labels} || []};
     my $labels_str = @label_names ? join(', ', @label_names) : 'none';
-    
+
     # Determine repo-specific path for code context
     my $repos_dir = $self->{config}{repos_dir} || '';
     $repos_dir =~ s/^~/$ENV{HOME}/;  # Expand tilde
@@ -480,13 +532,28 @@ sub _build_issue_context {
     } elsif ($repos_dir && -d "$repos_dir/$owner/" . lc($name)) {
         $repo_path = "$repos_dir/$owner/" . lc($name);
     }
-    
+
+    # Re-analysis context: when this is a follow-up to a prior bot response,
+    # surface the prior recommendation + summary so the analyzer can engage
+    # with what was already said instead of starting from scratch.
+    my $issue_id = "issue:$owner/$name#$number";
+    my $prior_response;
+    my $prior_message;
+    if ($self->{_re_analysis}) {
+        my $history = $self->{state}->get_response_history($issue_id, 1);
+        if ($history && @$history) {
+            $prior_message = $history->[0]{message} || '';
+        }
+    }
+
     # Build context hash (Analyzer expects this format)
     my $context = {
-        type       => 'issue',
-        repo       => "$owner/$name",
-        repos_path => $repo_path,
-        discussion => {
+        type              => 'issue',
+        repo              => "$owner/$name",
+        repos_path        => $repo_path,
+        re_analysis       => $self->{_re_analysis} ? 1 : 0,
+        prior_response    => $prior_message,
+        discussion        => {
             number   => $number,
             title    => $issue->{title},
             body     => $issue->{body} || '',
@@ -498,7 +565,7 @@ sub _build_issue_context {
         comments => $comments,
         events   => $events,
     };
-    
+
     return $context;
 }
 
@@ -699,6 +766,140 @@ sub _extract_triage_json {
     return undef;
 }
 
+=head2 _detect_persistent_issue_language
+
+Scan recent user comments for phrases that indicate the reporter believes the
+issue is still happening despite a prior fix. Used to override an
+`already-addressed` recommendation so the bot doesn't confidently assert a
+fix worked when the user explicitly says it didn't.
+
+Returns 1 if any user comment matches the persistence patterns, 0 otherwise.
+Bot and maintainer comments are ignored so a stray "not fixed yet" in a
+bot's own reply doesn't trigger this.
+
+=cut
+
+sub _detect_persistent_issue_language {
+    my ($self, $comments) = @_;
+
+    return 0 unless $comments && ref($comments) eq 'ARRAY';
+
+    # Patterns intentionally conservative - we only want to override on
+    # clear user-persistence signals, not on casual mentions. Each pattern
+    # is matched case-insensitively against the comment body. We allow
+    # markdown chars (**, _, `) and whitespace between significant tokens
+    # because real bug reports routinely wrap emphasis around words.
+    my @patterns = (
+        qr/\b(still\s+(broken|failing|happening|occurring|occurs?|broken|not\s+working|crashing))\b/i,
+        qr/\bnot\s+fixed\b/i,
+        qr/\bdoesn"?t\s+[\s\*_]*?(work|fix|help)\b/i,
+        qr/\bdoes\s+not[\s\*_]*?(work|fix|help)\b/i,
+        qr/\bdidn"?t\s+[\s\*_]*?(work|fix|help)\b/i,
+        qr/\bdid\s+not[\s\*_]*?(work|fix|help)\b/i,
+        qr/\bissue\s+(is\s+)?(still\s+)?(open|persists?|persisting|reproduc\w*)\b/i,
+        qr/\breproduc\w*\b/i,
+        qr/\bnope\b.*\b(fix|work|help)/i,
+        qr/\b(can"?t|cannot|can\s+not)\s+[\s\*_]*?(use|work|run|start)\b/i,
+        # "new logs same error" / "same error in new logs" - both orderings
+        qr/\bnew\s+(log|logs|stack\s*trace|error|output)\b.*\b(same|still|persists?|happening|failing)\b/i,
+        qr/\b(same|still|persists?|happening|failing)\b.*\bnew\s+(log|logs|stack\s*trace|error|output)\b/i,
+        qr/\bsame\s+(error|issue|problem|failure|crash)\b.*\b(still|now|persists?|happening)\b/i,
+    );
+
+    my $bot_user = $self->{config}{bot_username} || '';
+    my $maintainers = $self->{config}{maintainers} || [];
+
+    for my $c (@$comments) {
+        my $author = $c->{author} || '';
+        next if $author =~ /\[bot\]$/i;
+        next if $author =~ /clio/i;
+        next if $author eq 'github-actions';
+        next if $bot_user && $author eq $bot_user;
+        next if grep { $_ eq $author } @$maintainers;
+
+        my $body = $c->{body} || '';
+        for my $p (@patterns) {
+            return 1 if $body =~ $p;
+        }
+    }
+
+    return 0;
+}
+
+=head2 _is_substantively_same
+
+Compare a new triage to the bot's prior response and decide whether the
+new triage would just restate the same conclusion. Used to avoid posting
+duplicate near-identical summaries when a user comment didn't actually
+change anything material (see fewtarius/llama-ai#9).
+
+Returns 1 if the recommendation, classification, priority, and the gist of
+the summary all match the prior response, 0 otherwise.
+
+=cut
+
+sub _is_substantively_same {
+    my ($self, $new_triage, $prior_message) = @_;
+
+    return 0 unless $new_triage && $prior_message && length $prior_message;
+
+    # Normalize: strip markdown emphasis, drop the standard CLIO footer,
+    # collapse whitespace, lowercase. This compares the actual content
+    # rather than markdown noise.
+    my $normalize = sub {
+        my $s = shift || '';
+        $s =~ s/[`*_]//g;
+        $s =~ s/\s+/ /g;
+        # Strip the standard CLIO footer that follows every triage comment.
+        $s =~ s/\s*this is an automated analysis\.\s*a maintainer will review shortly\.\s*//i;
+        # Strip any other automated-* footer variants.
+        $s =~ s/\s*automated\s+(triage|analysis)[\s\w.]*//i;
+        $s = lc($s);
+        $s =~ s/^\s+|\s+\z//g;
+        return $s;
+    };
+
+    my $new_summary = $normalize->($new_triage->{summary} || '');
+    return 0 unless length $new_summary;
+
+    # Pull summary-shaped content out of the prior comment by extracting
+    # the first chunk after "Analysis:" or "**Analysis:**". Fall back to
+    # the full prior message if those headers aren't present.
+    my $prior_summary = $prior_message;
+    if ($prior_message =~ /(?:^|\n)(?:\*\*)?Analysis:?\*?\*?\s*(.{0,800})/s) {
+        $prior_summary = $1;
+    }
+    $prior_summary = $normalize->($prior_summary);
+
+    return 0 unless length $prior_summary;
+
+    # Truncate to a comparable window and use a Jaccard-like token
+    # similarity. If the first ~200 normalized chars of each share
+    # >= 65% of their tokens, the new triage is effectively a restatement
+    # of the prior one and we skip posting to avoid the duplicate-comment
+    # problem from fewtarius/llama-ai#9.
+    my $new_short = substr($new_summary, 0, 200);
+    my $prior_short = substr($prior_summary, 0, 200);
+
+    my %new_tokens = map { $_ => 1 } split /\s+/, $new_short;
+    my %prior_tokens = map { $_ => 1 } split /\s+/, $prior_short;
+    my $new_count = scalar(keys %new_tokens);
+    my $prior_count = scalar(keys %prior_tokens);
+    return 0 unless $new_count || $prior_count;
+
+    my $shared = 0;
+    for my $t (keys %new_tokens) {
+        $shared++ if $prior_tokens{$t};
+    }
+    # Jaccard = |A intersect B| / |A union B|
+    my $union = $new_count + $prior_count - $shared;
+    return 0 unless $union;
+
+    my $jaccard = $shared / $union;
+
+    return $jaccard >= 0.65 ? 1 : 0;
+}
+
 =head2 _apply_triage
 
 Apply triage results: labels, assignment, comment. All side-effect operations
@@ -740,6 +941,12 @@ sub _apply_triage {
     # and runs even if label/assign/close steps above failed.
     my $rec = $triage->{recommendation} || 'ready-for-review';
 
+    # Whether this is a follow-up to our own prior response. Used by the
+    # comment formatters to label the comment as a follow-up rather than
+    # re-emit an "Automated Triage Summary" header that looks like a fresh
+    # triage to readers.
+    my $followup = $self->{_re_analysis} ? 1 : 0;
+
     if ($rec eq 'close') {
         $self->_post_close_comment($owner, $name, $number, $triage);
     } elsif ($rec eq 'needs-info') {
@@ -747,7 +954,7 @@ sub _apply_triage {
     } elsif ($rec eq 'already-addressed') {
         $self->_post_addressed_comment($owner, $name, $number, $triage);
     } else {
-        $self->_post_triage_comment($owner, $name, $number, $triage);
+        $self->_post_triage_comment($owner, $name, $number, $triage, $followup);
     }
 }
 
@@ -851,14 +1058,21 @@ Post a triage summary comment on the issue.
 =cut
 
 sub _post_triage_comment {
-    my ($self, $owner, $name, $number, $triage) = @_;
+    my ($self, $owner, $name, $number, $triage, $followup) = @_;
     
     my $classification = $triage->{classification} || 'unknown';
     my $priority = $triage->{priority} || 'medium';
     my $completeness = $triage->{completeness} || 'N/A';
     my $summary = $triage->{summary} || 'Issue triaged successfully.';
     
-    my $comment = "## Automated Triage Summary\n\n";
+    my $comment = $followup
+        ? "## Follow-up Triage\n\n"
+        : "## Automated Triage Summary\n\n";
+
+    if ($followup) {
+        $comment .= "_Re-analysis triggered by new activity on this issue. Updated triage based on the latest comments._\n\n";
+    }
+
     $comment .= "| Field | Value |\n|-------|-------|\n";
     $comment .= "| Classification | \`$classification\` |\n";
     $comment .= "| Priority | \`$priority\` |\n";

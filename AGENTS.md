@@ -399,6 +399,7 @@ $self->{dbh}->do(q{
 | `maintainers` | `[]` | Usernames to skip |
 | `max_response_age_hours` | 24 | Don't respond to old discussions |
 | `response_cooldown_minutes` | 30 | Min time between responses |
+| `max_responses_per_issue` | 2 | Max triage responses per issue (re-analysis cap) |
 | `prompts_dir` | (bundled) | Directory containing custom prompt templates |
 | `alert_file` | `~/.clio/helper-alerts.log` | Maintainer alert log file |
 | `notify_in_thread` | false | @mention maintainers in flagged threads |
