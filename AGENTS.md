@@ -224,10 +224,10 @@ All modules in this project live under `CLIO::Daemon::*` namespace.
 
 **Use MiniMax for all sub-agents:**
 ```
-agent_operations(operation: "spawn", task: "...", working_dir: "./CLIO-helper", model: "minimax/minimax-m2.7")
+agent_operations(operation: "spawn", task: "...", working_dir: "./CLIO-helper", model: "minimax/minimax-m3")
 ```
 
-MiniMax-M2.7 via MiniMax is the recommended default for all standard tasks: investigation, QA, implementation, code review, refactoring, documentation.
+MiniMax-M3 via MiniMax is the recommended default for all standard tasks: investigation, QA, implementation, code review, refactoring, documentation.
 
 ---
 
@@ -394,7 +394,7 @@ $self->{dbh}->do(q{
 | `repos` | `.github` | Array of `{owner, repo}` to monitor |
 | `poll_interval_seconds` | 120 | Polling frequency |
 | `github_token` | `$GH_TOKEN` | GitHub personal access token |
-| `model` | `minimax/MiniMax-M2.7` | AI model in provider/model format |
+| `model` | `minimax/MiniMax-M3` | AI model in provider/model format |
 | `dry_run` | false | Analyze without posting |
 | `maintainers` | `[]` | Usernames to skip |
 | `max_response_age_hours` | 24 | Don't respond to old discussions |

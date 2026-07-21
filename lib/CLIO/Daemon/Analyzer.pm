@@ -34,7 +34,7 @@ CLIO::Daemon::Analyzer - AI-powered conversation analysis for Discussion Monitor
     use CLIO::Daemon::Analyzer;
     
     my $analyzer = CLIO::Daemon::Analyzer->new(
-        model => 'minimax/MiniMax-M2.7',
+        model => 'minimax/MiniMax-M3',
         debug => 1,
     );
     
@@ -57,7 +57,7 @@ Uses CLIO AI capabilities to:
 Create a new Analyzer instance.
 
 Arguments (hash):
-- model: AI model name in provider/model format (default: minimax/MiniMax-M2.7)
+- model: AI model name in provider/model format (default: minimax/MiniMax-M3)
 - debug: Enable debug logging (default: 0)
 - clio_path: Path to CLIO executable (default: 'clio')
 - repos_path: Path to cloned repos for code context (optional)
@@ -70,7 +70,7 @@ sub new {
     my ($class, %args) = @_;
 
     my $self = {
-        model         => $args{model} || 'minimax/MiniMax-M2.7',
+        model         => $args{model} || 'minimax/MiniMax-M3',
         debug         => $args{debug} || 0,
         clio_path     => $args{clio_path} || 'clio',
         repos_path    => $args{repos_path} || '',   # Path to cloned repos for context

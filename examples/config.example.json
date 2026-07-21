@@ -14,7 +14,7 @@
     "poll_interval_seconds": 120,
     "github_token": "",
     "posting_token": "",
-    "model": "minimax/MiniMax-M2.7",
+    "model": "minimax/MiniMax-M3",
     "clio_path": "clio",
     "dry_run": false,
     "maintainers": ["fewtarius"],
