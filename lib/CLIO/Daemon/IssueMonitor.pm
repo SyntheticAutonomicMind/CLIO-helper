@@ -266,7 +266,8 @@ sub _poll_repo {
 
             # Cap: don't re-triage beyond max_responses_per_issue. Prevents
             # the bot from posting another near-duplicate analysis when
-            # the conversation keeps cycling (see fewtarius/llama-ai#9).
+            # the conversation keeps cycling on an issue where a user
+            # comment didn't materially change anything.
             my $max_responses = $self->{config}{max_responses_per_issue} || 2;
             my $response_count = $self->{state}->get_response_count($issue_id);
             if ($response_count >= $max_responses) {
@@ -453,32 +454,22 @@ sub _triage_issue {
     # fall back to extracting from the raw message
     my $triage = $result->{triage} || $self->_extract_triage_json($result);
 
-    # Programmatic override: if this is a re-analysis and the user has
-    # reported the issue is still broken since the prior bot response, do
-    # NOT post `already-addressed` regardless of what the AI returned.
-    # This is the bug behind fewtarius/llama-ai#8 where the bot confidently
-    # asserted a fix existed despite the user explicitly saying it didn't.
-    if ($triage && ($triage->{recommendation} || '') eq 'already-addressed'
-        && $self->{_re_analysis}) {
-        my $user_says_persists = $self->_detect_persistent_issue_language(
-            $context->{comments} || []
-        );
-        if ($user_says_persists) {
-            $self->_log("INFO", "Overriding already-addressed -> ready-for-review: user reports persistence");
-            $triage->{recommendation} = 'ready-for-review';
-            $triage->{summary} = (
-                'The reporter says this issue is still occurring after the '
-              . 'linked fix. Downgrading from `already-addressed` to '
-              . '`ready-for-review` so a maintainer can verify. '
-              . '(Automated override based on persistence signal in recent user comments.) '
-            );
-        }
-    }
+    # Note: we intentionally do NOT programmatically override the model's
+    # `already-addressed` recommendation. Earlier versions of this code
+    # used a regex-based persistence detector to catch cases like "still
+    # broken" / "not fixed" and force the recommendation to ready-for-review
+    # when the user reported persistence. That guard was too narrow (it
+    # missed indirect signals like "I believe I am on master" + "let me
+    # test more configs") and brittle (the regex had to be expanded every
+    # time a new phrasing came up). The prompt's RE-ANALYSIS PROTOCOL now
+    # instructs the model to engage with the user's actual message and
+    # default to ready-for-review unless the user explicitly confirms
+    # resolution - the model does this reasoning better than a regex can.
 
     # No-meaningful-change guard: if this is a re-analysis and the AI's
     # new triage would be substantively identical to the prior response,
-    # skip posting to avoid the duplicate-comment problem from
-    # fewtarius/llama-ai#9.
+    # skip posting to avoid posting a duplicate of the bot's own comment
+    # when a user's follow-up didn't actually change anything material.
     if ($triage && $self->{_re_analysis} && $context->{prior_response}) {
         if ($self->_is_substantively_same($triage, $context->{prior_response})) {
             $self->_log("INFO", "Skipping follow-up comment: no substantive change from prior response");
@@ -539,10 +530,12 @@ sub _build_issue_context {
     my $issue_id = "issue:$owner/$name#$number";
     my $prior_response;
     my $prior_message;
+    my $prior_posted_at;
     if ($self->{_re_analysis}) {
         my $history = $self->{state}->get_response_history($issue_id, 1);
         if ($history && @$history) {
-            $prior_message = $history->[0]{message} || '';
+            $prior_message   = $history->[0]{message} || '';
+            $prior_posted_at = $history->[0]{posted_at} || '';
         }
     }
 
@@ -553,6 +546,9 @@ sub _build_issue_context {
         repos_path        => $repo_path,
         re_analysis       => $self->{_re_analysis} ? 1 : 0,
         prior_response    => $prior_message,
+        prior_response_posted_at => $prior_posted_at,
+        bot_username      => $self->{config}{bot_username} || '',
+        maintainers       => $self->{config}{maintainers} || [],
         discussion        => {
             number   => $number,
             title    => $issue->{title},
@@ -766,72 +762,12 @@ sub _extract_triage_json {
     return undef;
 }
 
-=head2 _detect_persistent_issue_language
-
-Scan recent user comments for phrases that indicate the reporter believes the
-issue is still happening despite a prior fix. Used to override an
-`already-addressed` recommendation so the bot doesn't confidently assert a
-fix worked when the user explicitly says it didn't.
-
-Returns 1 if any user comment matches the persistence patterns, 0 otherwise.
-Bot and maintainer comments are ignored so a stray "not fixed yet" in a
-bot's own reply doesn't trigger this.
-
-=cut
-
-sub _detect_persistent_issue_language {
-    my ($self, $comments) = @_;
-
-    return 0 unless $comments && ref($comments) eq 'ARRAY';
-
-    # Patterns intentionally conservative - we only want to override on
-    # clear user-persistence signals, not on casual mentions. Each pattern
-    # is matched case-insensitively against the comment body. We allow
-    # markdown chars (**, _, `) and whitespace between significant tokens
-    # because real bug reports routinely wrap emphasis around words.
-    my @patterns = (
-        qr/\b(still\s+(broken|failing|happening|occurring|occurs?|broken|not\s+working|crashing))\b/i,
-        qr/\bnot\s+fixed\b/i,
-        qr/\bdoesn"?t\s+[\s\*_]*?(work|fix|help)\b/i,
-        qr/\bdoes\s+not[\s\*_]*?(work|fix|help)\b/i,
-        qr/\bdidn"?t\s+[\s\*_]*?(work|fix|help)\b/i,
-        qr/\bdid\s+not[\s\*_]*?(work|fix|help)\b/i,
-        qr/\bissue\s+(is\s+)?(still\s+)?(open|persists?|persisting|reproduc\w*)\b/i,
-        qr/\breproduc\w*\b/i,
-        qr/\bnope\b.*\b(fix|work|help)/i,
-        qr/\b(can"?t|cannot|can\s+not)\s+[\s\*_]*?(use|work|run|start)\b/i,
-        # "new logs same error" / "same error in new logs" - both orderings
-        qr/\bnew\s+(log|logs|stack\s*trace|error|output)\b.*\b(same|still|persists?|happening|failing)\b/i,
-        qr/\b(same|still|persists?|happening|failing)\b.*\bnew\s+(log|logs|stack\s*trace|error|output)\b/i,
-        qr/\bsame\s+(error|issue|problem|failure|crash)\b.*\b(still|now|persists?|happening)\b/i,
-    );
-
-    my $bot_user = $self->{config}{bot_username} || '';
-    my $maintainers = $self->{config}{maintainers} || [];
-
-    for my $c (@$comments) {
-        my $author = $c->{author} || '';
-        next if $author =~ /\[bot\]$/i;
-        next if $author =~ /clio/i;
-        next if $author eq 'github-actions';
-        next if $bot_user && $author eq $bot_user;
-        next if grep { $_ eq $author } @$maintainers;
-
-        my $body = $c->{body} || '';
-        for my $p (@patterns) {
-            return 1 if $body =~ $p;
-        }
-    }
-
-    return 0;
-}
-
 =head2 _is_substantively_same
 
 Compare a new triage to the bot's prior response and decide whether the
 new triage would just restate the same conclusion. Used to avoid posting
 duplicate near-identical summaries when a user comment didn't actually
-change anything material (see fewtarius/llama-ai#9).
+change anything material.
 
 Returns 1 if the recommendation, classification, priority, and the gist of
 the summary all match the prior response, 0 otherwise.
@@ -876,8 +812,8 @@ sub _is_substantively_same {
     # Truncate to a comparable window and use a Jaccard-like token
     # similarity. If the first ~200 normalized chars of each share
     # >= 65% of their tokens, the new triage is effectively a restatement
-    # of the prior one and we skip posting to avoid the duplicate-comment
-    # problem from fewtarius/llama-ai#9.
+    # of the prior one and we skip posting to avoid emitting a duplicate
+    # bot comment that doesn't add anything the user hasn't already seen.
     my $new_short = substr($new_summary, 0, 200);
     my $prior_short = substr($prior_summary, 0, 200);
 

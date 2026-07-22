@@ -143,6 +143,32 @@ sub _build_discussion_prompt {
 
     my $disc = $context->{discussion};
     my @comments = @{$context->{comments} || []};
+    my $is_re_analysis = $context->{re_analysis} ? 1 : 0;
+
+    # On re-analysis, drop any comments that were authored by the bot or
+    # that predate the bot's prior response. Those are not part of the
+    # "what happened after CLIO spoke" narrative the model needs to engage
+    # with - they would only duplicate the Prior CLIO Response section
+    # below and confuse the conversation flow.
+    if ($is_re_analysis && $context->{prior_response_posted_at}) {
+        my $prior_ts = $context->{prior_response_posted_at};
+        my $bot_user = $context->{bot_username} || '';
+        my $maintainers = $context->{maintainers} || [];
+        my @filtered;
+        for my $c (@comments) {
+            my $author = $c->{author} || '';
+            next if $bot_user && $author eq $bot_user;
+            next if $author =~ /clio/i;
+            next if $author =~ /\[bot\]$/i;
+            next if $author eq 'github-actions';
+            next if grep { $_ eq $author } @$maintainers;
+            if ($prior_ts && $c->{created} && $c->{created} le $prior_ts) {
+                next;
+            }
+            push @filtered, $c;
+        }
+        @comments = @filtered;
+    }
 
     # Build conversation thread
     my $thread = "## Discussion Thread\n\n";
@@ -154,15 +180,23 @@ sub _build_discussion_prompt {
     $thread .= "### Original Post\n\n";
     $thread .= $disc->{body} . "\n\n";
 
-    # Re-analysis marker + prior CLIO response. When present, the
-    # RE-ANALYSIS PROTOCOL section in the loaded prompt instructs the model
-    # to engage with the prior response instead of producing a duplicate.
-    if ($context->{re_analysis}) {
-        $thread .= "### RE-ANALYSIS FLAG\n\n";
-        $thread .= "**This is a re-analysis.** CLIO has already posted a response to this issue. The re-analysis protocol in the prompt applies. Do not produce a duplicate of the prior response.\n\n";
+    # Re-analysis framing. The model needs to see (a) the prior response,
+    # (b) what happened after it, in chronological order. Comments older
+    # than CLIO's response or from CLIO itself have already been filtered
+    # out above, so what's left in @comments is exactly the activity that
+    # triggered this re-analysis.
+    if ($is_re_analysis) {
+        $thread .= "### Re-analysis Notice\n\n";
+        $thread .= "CLIO already responded to this issue on "
+                 . ($context->{prior_response_posted_at} || 'an earlier pass')
+                 . ". The comments below are what happened AFTER that response. "
+                 . "Your job is to engage with that activity, not re-triage the "
+                 . "original issue from scratch. Default to `ready-for-review` "
+                 . "unless the most recent user message explicitly confirms the "
+                 . "issue is resolved.\n\n";
     }
     if ($context->{prior_response} && length $context->{prior_response}) {
-        $thread .= "### Prior CLIO response\n\n";
+        $thread .= "### CLIO's Prior Response\n\n";
         # Truncate so a verbose prior summary doesn't dominate the prompt.
         my $prior = $context->{prior_response};
         if (length($prior) > 4000) {
@@ -172,11 +206,17 @@ sub _build_discussion_prompt {
     }
 
     if (@comments) {
-        $thread .= "### Comments\n\n";
+        my $section = $is_re_analysis
+            ? "### Activity Since CLIO's Response (chronological)\n\n"
+            : "### Comments\n\n";
+        $thread .= $section;
         for my $c (@comments) {
             $thread .= "**\@$c->{author}** ($c->{created}):\n";
             $thread .= $c->{body} . "\n\n";
         }
+    } elsif ($is_re_analysis) {
+        $thread .= "### Activity Since CLIO's Response\n\n";
+        $thread .= "_No new comments since CLIO's prior response._\n\n";
     }
 
     $thread = $self->_strip_invisible_chars($thread);
@@ -330,6 +370,12 @@ sub _substitute_placeholders {
 =head2 _default_prompt
 
 Returns the built-in default prompt (fallback).
+
+This fallback is only used when no `prompts_dir` is configured. It is
+specifically tuned for the SyntheticAutonomicMind / CLIO community
+discussions, so most operators will want to provide their own prompt
+templates via the `prompts_dir` config option. Operators monitoring
+other organizations should NOT rely on this fallback.
 
 =cut
 
