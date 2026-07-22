@@ -1,8 +1,6 @@
 {
     "repos": [
-        {"owner": "SyntheticAutonomicMind", "repo": "CLIO"},
-        {"owner": "SyntheticAutonomicMind", "repo": "SAM"},
-        {"owner": "SyntheticAutonomicMind", "repo": "ALICE"}
+        {"owner": "your-org", "repo": "your-repo"}
     ],
     "monitors": {
         "discussions": true,
@@ -17,7 +15,7 @@
     "model": "minimax/MiniMax-M3",
     "clio_path": "clio",
     "dry_run": false,
-    "maintainers": ["fewtarius"],
+    "maintainers": ["your-maintainer-username"],
 
     "log_file": "~/.clio/helper-daemon.log",
     "state_file": "~/.clio/helper-state.db",
@@ -49,8 +47,8 @@
 
     "_prompt_placeholders": {
         "comment": "These values substitute {{ORG_NAME}}, {{BOT_NAME}}, and {{BOT_SIGNATURE}} in bundled prompts. Defaults are derived from the first configured repo's owner field and the bot_username config.",
-        "org_name": "SyntheticAutonomicMind",
-        "bot_username": "CLIO-Bot",
-        "bot_signature": "- CLIO"
+        "org_name": "your-org",
+        "bot_username": "your-bot-username",
+        "bot_signature": "- YourBot"
     }
 }

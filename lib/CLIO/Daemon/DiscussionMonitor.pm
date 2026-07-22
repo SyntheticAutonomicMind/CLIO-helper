@@ -60,14 +60,13 @@ Config file (~/.clio/discuss-config.json):
 
     {
         "repos": [
-            {"owner": "SyntheticAutonomicMind", "repo": ".github"},
-            {"owner": "SyntheticAutonomicMind", "repo": "clio"}
+            {"owner": "your-org", "repo": "your-repo"}
         ],
         "poll_interval_seconds": 120,
         "github_token": "ghp_...",
         "model": "minimax/MiniMax-M3",
         "dry_run": false,
-        "maintainers": ["fewtarius"],
+        "maintainers": ["your-maintainer-username"],
         "log_file": "~/.clio/discuss-daemon.log"
     }
 
@@ -165,15 +164,13 @@ Return default configuration values.
 
 sub _default_config {
    return {
-       repos => [
-           { owner => 'SyntheticAutonomicMind', repo => '.github' },
-       ],
+       repos => [],
        poll_interval_seconds => 120,  # 2 minutes
        github_token => $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
        posting_token => $ENV{CLIO_POSTING_TOKEN} || '',  # Separate token for posting comments (optional)
        model => 'minimax/MiniMax-M3',
        dry_run => 0,
-       maintainers => ['fewtarius'],
+       maintainers => [],
        bot_username => '',  # Bot's GitHub username (auto-detected if empty)
        log_file => "$ENV{HOME}/.clio/discuss-daemon.log",
        alert_file => "$ENV{HOME}/.clio/discuss-alerts.log",  # Maintainer alert log

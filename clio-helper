@@ -41,8 +41,7 @@ Create ~/.clio/helper-config.json:
 
     {
         "repos": [
-            {"owner": "SyntheticAutonomicMind", "repo": "CLIO"},
-            {"owner": "SyntheticAutonomicMind", "repo": ".github"}
+            {"owner": "your-org", "repo": "your-repo"}
         ],
         "monitors": {
             "discussions": true,
@@ -55,7 +54,7 @@ Create ~/.clio/helper-config.json:
         "github_token": "ghp_...",
         "model": "minimax/MiniMax-M3",
         "dry_run": false,
-        "maintainers": ["fewtarius"]
+        "maintainers": ["your-maintainer-username"]
     }
 
 Alternatively, set GH_TOKEN or GITHUB_TOKEN environment variables.
@@ -140,6 +139,14 @@ my $config = _load_config($config_file);
 # Apply command-line overrides
 $config->{dry_run} = 1 if $opts{dry_run};
 $config->{debug}   = 1 if $opts{debug};
+
+# Warn if the operator hasn't configured any repos to monitor. We no
+# longer ship a default repo list because the public helper agent is
+# used by organizations other than the one that develops it - silently
+# monitoring the wrong repos would be worse than failing loudly.
+unless (@{$config->{repos} || []}) {
+    _log("WARN", "No repos configured in $config_file - nothing to monitor. Set 'repos' to a non-empty list of {owner, repo} hashes.");
+}
 
 # Determine which monitors to run
 my %enabled_monitors = _resolve_monitors($config, $opts{monitor});
@@ -252,7 +259,7 @@ sub _load_config {
     }
     
     # Apply defaults
-    $config->{repos}                    //= [{ owner => 'SyntheticAutonomicMind', repo => '.github' }];
+    $config->{repos}                    //= [];
     $config->{monitors}                 //= {};
     $config->{monitors}{discussions}    //= 1;
     $config->{monitors}{issues}         //= 1;
@@ -264,7 +271,7 @@ sub _load_config {
     $config->{posting_token}            //= $ENV{CLIO_POSTING_TOKEN} || '';
     $config->{model}                    //= 'minimax/MiniMax-M3';
     $config->{dry_run}                  //= 0;
-    $config->{maintainers}              //= ['fewtarius'];
+    $config->{maintainers}              //= [];
     $config->{state_file}               //= "$ENV{HOME}/.clio/helper-state.db";
     $config->{log_file}                 //= "$ENV{HOME}/.clio/helper-daemon.log";
     $config->{lock_file}                //= "$ENV{HOME}/.clio/helper.lock";
