@@ -797,27 +797,33 @@ sub _sync_repo {
     my $s_repo_path = "$s_repos_dir/$s_owner/$s_name";
     
     if (-d "$repo_path/.git") {
-        # Repo exists, fetch all branches and pull
-        $self->_log("DEBUG", "Fetching latest for $owner/$name");
+        # Repo exists, fetch all branches and pull - MUST recurse submodules
+        # or the bot will see stale code (e.g. fewtarius/llama-ai#11).
+        $self->_log("DEBUG", "Fetching latest for $owner/$name (with submodules)");
         local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
-        my $result = `cd "$s_repo_path" && git fetch --all 2>&1 && git pull 2>&1`;
+        my $result = `cd "$s_repo_path" && git fetch --all --recurse-submodules 2>&1 && git pull --rebase --recurse-submodules 2>&1`;
         my $exit_code = $? >> 8;
         if ($exit_code != 0) {
-            $self->_log("WARN", "Git fetch/pull failed for $owner/$name: $result");
-            # Try reset and pull
-            `cd "$s_repo_path" && git fetch origin && git reset --hard origin/HEAD 2>&1`;
+            $self->_log("WARN", "Git fetch/pull failed for $owner/$name, trying reset: $result");
+            # Reset and re-pull with submodules explicitly
+            `cd "$s_repo_path" && git fetch --recurse-submodules origin 2>&1`;
+            `cd "$s_repo_path" && git reset --hard origin/HEAD 2>&1`;
+            `cd "$s_repo_path" && git submodule update --init --recursive 2>&1`;
+        } else {
+            # Ensure nested submodules are also updated
+            `cd "$s_repo_path" && git submodule update --init --recursive 2>&1`;
         }
     } else {
-        # Clone the repo
-        $self->_log("INFO", "Cloning $owner/$name for PR review context");
+        # Clone the repo - must recurse submodules on initial clone
+        $self->_log("INFO", "Cloning $owner/$name for PR review context (with submodules)");
         require File::Path;
         File::Path::mkpath("$repos_dir/$owner");
-        
+
         local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
         my $clone_url = "https://github.com/$s_owner/$s_name.git";
-        my $result = `git clone "$clone_url" "$s_repo_path" 2>&1`;
+        my $result = `git clone --recurse-submodules "$clone_url" "$s_repo_path" 2>&1`;
         my $exit_code = $? >> 8;
-        
+
         if ($exit_code != 0) {
             $self->_log("WARN", "Git clone failed for $owner/$name: $result");
             return '';

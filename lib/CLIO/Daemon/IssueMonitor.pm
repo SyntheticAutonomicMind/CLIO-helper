@@ -339,6 +339,69 @@ sub _poll_repo {
     }
 }
 
+=head2 _sync_repo
+
+Clone or pull the latest code from a repository with submodule support.
+Called lazily when we need code context for analysis.
+
+=cut
+
+sub _sync_repo {
+    my ($self, $owner, $name) = @_;
+    
+    return unless $self->{config}{auto_pull};
+    
+    my $repos_dir = $self->{config}{repos_dir};
+    $repos_dir =~ s/^~/$ENV{HOME}/;
+    
+    # Sanitize for shell interpolation
+    my $s_repos_dir = _safe_shell_arg($repos_dir);
+    my $s_owner     = _safe_shell_arg($owner);
+    my $s_name      = _safe_shell_arg($name);
+    
+    # Create repos directory if needed
+    unless (-d $repos_dir) {
+        require File::Path;
+        File::Path::mkpath($repos_dir);
+        $self->_log("DEBUG", "Created repos directory: $repos_dir");
+    }
+    
+    my $repo_path = "$repos_dir/$owner/$name";
+    my $s_repo_path = "$s_repos_dir/$s_owner/$s_name";
+    
+    if (-d "$repo_path/.git") {
+        # Repo exists, pull latest with submodules
+        $self->_log("DEBUG", "Pulling latest for $owner/$name (with submodules)");
+        my $result = `cd "$s_repo_path" && git pull --recurse-submodules 2>&1`;
+        my $exit_code = $? >> 8;
+        
+        if ($exit_code != 0) {
+            $self->_log("WARN", "Git pull failed for $owner/$name: $result");
+            # Try reset and pull
+            `cd "$s_repo_path" && git fetch origin --recurse-submodules && git reset --hard origin/HEAD && git submodule update --init --recursive 2>&1`;
+        } else {
+            # Ensure submodules are updated even if pull succeeded
+            `cd "$s_repo_path" && git submodule update --init --recursive 2>&1`;
+        }
+    } else {
+        # Clone the repo with submodules
+        $self->_log("INFO", "Cloning $owner/$name with submodules");
+        
+        require File::Path;
+        File::Path::mkpath("$repos_dir/$owner");
+        
+        my $clone_url = "https://github.com/$s_owner/$s_name.git";
+        my $result = `git clone --recurse-submodules "$clone_url" "$s_repo_path" 2>&1`;
+        my $exit_code = $? >> 8;
+        
+        if ($exit_code != 0) {
+            $self->_log("WARN", "Git clone failed for $owner/$name: $result");
+        } else {
+            $self->_log("INFO", "Cloned $owner/$name to $repo_path");
+        }
+    }
+}
+
 =head2 _fetch_issues
 
 Fetch recent issues from a repository using gh CLI.
@@ -525,6 +588,12 @@ sub _build_issue_context {
     my ($self, $owner, $name, $issue) = @_;
 
     my $number = $issue->{number};
+
+    # Sync repo first to ensure we have the latest code (including submodules)
+    # This is critical for analyzing submodule-heavy repos like fewtarius/llama-ai
+    # where CachyLLama is a submodule that must be updated for the bot to
+    # see the actual code it needs to analyze.
+    $self->_sync_repo($owner, $name);
 
     # Fetch comments
     my $comments = $self->_fetch_issue_comments($owner, $name, $number);

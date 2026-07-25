@@ -258,27 +258,36 @@ sub _sync_repo {
     my $s_repo_path = "$s_repos_dir/$s_owner/$s_name";
     
     if (-d "$repo_path/.git") {
-        # Repo exists, pull latest
-        $self->_log("DEBUG", "Pulling latest for $owner/$name");
-        my $result = `cd "$s_repo_path" && git pull --rebase 2>&1`;
+        # Repo exists, pull latest - MUST recurse submodules or the bot
+        # will see stale code (e.g. fewtarius/llama-ai#11, where the
+        # CachyLLama submodule was 32 commits behind and the bot made
+        # confident wrong assertions about the user's checkout).
+        $self->_log("DEBUG", "Pulling latest for $owner/$name (with submodules)");
+        my $result = `cd "$s_repo_path" && git pull --rebase --recurse-submodules 2>&1`;
         my $exit_code = $? >> 8;
-        
+
         if ($exit_code != 0) {
-            $self->_log("WARN", "Git pull failed for $owner/$name: $result");
-            # Try reset and pull
-            `cd "$s_repo_path" && git fetch origin && git reset --hard origin/HEAD 2>&1`;
+            $self->_log("WARN", "Git pull failed for $owner/$name, trying reset: $result");
+            # Reset and re-pull with submodules. Some repos have submodules
+            # that need explicit init/update after a fast-forward.
+            `cd "$s_repo_path" && git fetch --recurse-submodules origin 2>&1`;
+            `cd "$s_repo_path" && git reset --hard origin/HEAD 2>&1`;
+            `cd "$s_repo_path" && git submodule update --init --recursive 2>&1`;
+        } else {
+            # Even when pull succeeds, ensure nested submodules are updated
+            `cd "$s_repo_path" && git submodule update --init --recursive 2>&1`;
         }
     } else {
-        # Clone the repo
-        $self->_log("INFO", "Cloning $owner/$name");
-        
+        # Clone the repo - must recurse submodules on initial clone too
+        $self->_log("INFO", "Cloning $owner/$name (with submodules)");
+
         require File::Path;
         File::Path::mkpath("$repos_dir/$owner");
-        
+
         my $clone_url = "https://github.com/$s_owner/$s_name.git";
-        my $result = `git clone --depth 1 "$clone_url" "$s_repo_path" 2>&1`;
+        my $result = `git clone --depth 1 --recurse-submodules "$clone_url" "$s_repo_path" 2>&1`;
         my $exit_code = $? >> 8;
-        
+
         if ($exit_code != 0) {
             $self->_log("WARN", "Git clone failed for $owner/$name: $result");
         } else {
