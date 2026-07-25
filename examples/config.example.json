@@ -1,6 +1,15 @@
 {
     "repos": [
-        {"owner": "your-org", "repo": "your-repo"}
+        {"owner": "your-org", "repo": "your-repo"},
+        {
+            "owner": "your-org",
+            "repo": "another-repo",
+            "prompts": {
+                "discussion": "~/.clio/prompts/another-repo-discussion.md",
+                "issue": "~/.clio/prompts/another-repo-issue.md",
+                "pr": "~/.clio/prompts/another-repo-pr.md"
+            }
+        }
     ],
     "monitors": {
         "discussions": true,

@@ -852,20 +852,107 @@ sub _extract_triage_json {
     
     my $message = $result->{message} || '';
     
-    # Try to find JSON in the response
-    if ($message =~ /\{[^{}]*"classification"[^{}]*\}/s) {
-        my $json_str = $&;
-        my $triage;
-        eval { $triage = decode_json($json_str); };
-        return $triage unless $@;
+    # Strip ANSI escape codes
+    $message =~ s/\x{1b}\[[0-9;]*[mK]//g;
+    
+    # Try to find JSON in markdown code fence first
+    my $json_str;
+    if ($message =~ /```json\s*(\{.*?\})\s*```/s) {
+        $json_str = $1;
     }
     
-    # Try parsing the whole message as JSON
+    # Try balanced brace extraction for nested JSON (handles root_cause, etc.)
+    unless ($json_str) {
+        $json_str = $self->_extract_balanced_json($message, 'classification');
+    }
+    
+    # Last resort: simple non-nested match
+    unless ($json_str) {
+        if ($message =~ /(\{[^{}]*"classification"[^{}]*\})/s) {
+            $json_str = $1;
+        }
+    }
+    
+    unless ($json_str) {
+        $self->_log("WARN", "Could not find JSON in analyzer response");
+        $self->_log("DEBUG", "Response was: " . substr($message, 0, 500));
+        return undef;
+    }
+    
+    # Strip any remaining ANSI codes from extracted JSON
+    $json_str =~ s/\x{1b}\[[0-9;]*[mK]//g;
+    
     my $triage;
-    eval { $triage = decode_json($message); };
-    return $triage if !$@ && ref($triage) eq 'HASH' && $triage->{classification};
+    eval {
+        $triage = decode_json($json_str);
+    };
+    if ($@) {
+        $self->_log("WARN", "Failed to parse JSON: $@");
+        $self->_log("DEBUG", "JSON was: " . substr($json_str, 0, 500));
+        return undef;
+    }
+    
+    return $triage if ref($triage) eq 'HASH' && $triage->{classification};
     
     return undef;
+}
+
+=head2 _extract_balanced_json
+
+Extract the largest balanced JSON object containing a specific key.
+Handles nested objects and arrays (unlike simple regex).
+
+=cut
+
+sub _extract_balanced_json {
+    my ($self, $text, $required_key) = @_;
+    
+    my $best_json;
+    my $best_len = 0;
+    
+    # Find all opening braces and try to match balanced JSON
+    while ($text =~ /\{/g) {
+        my $start = pos($text) - 1;
+        my $depth = 1;
+        my $in_string = 0;
+        my $escape = 0;
+        my $pos = $start + 1;
+        my $len = length($text);
+        
+        while ($pos < $len && $depth > 0) {
+            my $ch = substr($text, $pos, 1);
+            
+            if ($escape) {
+                $escape = 0;
+            } elsif ($ch eq '\\' && $in_string) {
+                $escape = 1;
+            } elsif ($ch eq '"' && !$escape) {
+                $in_string = !$in_string;
+            } elsif (!$in_string) {
+                if ($ch eq '{') { $depth++; }
+                elsif ($ch eq '}') { $depth--; }
+                elsif ($ch eq '[') { $depth++; }
+                elsif ($ch eq ']') { $depth--; }
+            }
+            $pos++;
+        }
+        
+        if ($depth == 0) {
+            my $candidate = substr($text, $start, $pos - $start);
+            
+            # Validate it's actual JSON with the required key
+            if ($candidate =~ /"$required_key"/ && length($candidate) > $best_len) {
+                my $parsed;
+                eval { $parsed = decode_json($candidate); };
+                if (!$@ && ref($parsed) eq 'HASH') {
+                    $best_json = $candidate;
+                    $best_len = length($candidate);
+                }
+            }
+        }
+    }
+    
+    return $best_json;
 }
 
 =head2 _is_substantively_same

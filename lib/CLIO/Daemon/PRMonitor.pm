@@ -406,7 +406,7 @@ sub _review_pr {
     }
     
     # Build context
-    my $context = $self->_build_pr_context($owner, $name, $pr);
+    my $context = $self->_build_pr_context($owner, $name, $pr, $is_update, $pr_id);
 
     # Pre-filter with programmatic guardrails
     my $guardrail_result = $self->_check_guardrails($context);
@@ -459,6 +459,27 @@ sub _review_pr {
     # Extract review JSON - prefer structured review from Analyzer,
     # fall back to extracting from raw message
     my $review = $result->{review} || $self->_extract_review_json($result);
+    
+    # No-meaningful-change suppression: if this is a re-review and the AI's
+    # new review would be substantively identical to the prior response,
+    # skip posting to avoid posting a duplicate of the bot's own comment
+    # when a user's follow-up didn't actually change anything material.
+    # Bypassed when the user directly @-mentioned CLIO: if someone took
+    # the trouble to address the bot, they want a response, not silence.
+    if ($review && $is_update && $context->{prior_response} && !$self->{_mention_triggered}) {
+        # Get prior response from state
+        my $history = $self->{state}->get_response_history($pr_id, 1);
+        my $prior_message = $history && @$history ? $history->[0]{message} : '';
+        
+        if ($self->_is_substantively_same($review, $prior_message)) {
+            $self->_log("INFO", "Skipping follow-up review: no substantive change from prior response");
+            $self->{state}->record_check($pr_id, 'skip-no-change');
+            # Still record that we processed it so we don't keep retrying.
+            $self->{state}->record_response($pr_id, 'skip', 'no substantive change');
+            $self->_restore_branch();
+            return;
+        }
+    }
     
     my $posted = 0;
     if ($review) {
@@ -672,7 +693,7 @@ Build analysis context for a PR.
 =cut
 
 sub _build_pr_context {
-    my ($self, $owner, $name, $pr) = @_;
+    my ($self, $owner, $name, $pr, $is_update, $pr_id) = @_;
     
     my $number = $pr->{number};
     
@@ -701,12 +722,28 @@ sub _build_pr_context {
         $original_branch = $self->_checkout_pr_head($repo_path, $pr);
     }
     
+    # Re-review context: when this is a follow-up to a prior bot response,
+    # surface the prior recommendation + summary so the analyzer can engage
+    # with what was already said instead of starting from scratch.
+    my $prior_response;
+    my $prior_posted_at;
+    if ($is_update) {
+        my $history = $self->{state}->get_response_history($pr_id, 1);
+        if ($history && @$history) {
+            $prior_response   = $history->[0]{message} || '';
+            $prior_posted_at  = $history->[0]{posted_at} || '';
+        }
+    }
+    
     my $context = {
         type              => 'pull_request',
         repo              => "$owner/$name",
         repos_path        => $repo_path,
+        re_review         => $is_update ? 1 : 0,
         mention_triggered => $self->{_mention_triggered} ? 1 : 0,
         mention_request   => $self->{_mention_request_body} || '',
+        prior_response    => $prior_response,
+        prior_response_posted_at => $prior_posted_at,
         discussion        => {
             number   => $number,
             title    => $pr->{title},
@@ -1103,6 +1140,80 @@ sub _is_re_review_request {
     return 0;
 }
 
+=head2 _is_substantively_same
+
+Compare a new review to the bot's prior response and decide whether the
+new review would just restate the same conclusion. Used to avoid posting
+duplicate near-identical reviews when a user comment didn't actually
+change anything material.
+
+Returns 1 if the recommendation, summary, and key findings all match the
+prior response, 0 otherwise.
+
+=cut
+
+sub _is_substantively_same {
+    my ($self, $new_review, $prior_message) = @_;
+
+    return 0 unless $new_review && $prior_message && length $prior_message;
+
+    # Normalize: strip markdown emphasis, drop the standard CLIO footer,
+    # collapse whitespace, lowercase. This compares the actual content
+    # rather than markdown noise.
+    my $normalize = sub {
+        my $s = shift || '';
+        $s =~ s/[`*_]//g;
+        $s =~ s/\s+/ /g;
+        # Strip the standard CLIO footer that follows every review comment.
+        $s =~ s/\s*this is an automated review\.\s*a human maintainer will provide final approval\.\s*//i;
+        # Strip any other automated-* footer variants.
+        $s =~ s/\s*automated\s+(review|analysis)[\s\w.]*//i;
+        $s = lc($s);
+        $s =~ s/^\s+|\s+\z//g;
+        return $s;
+    };
+
+    my $new_summary = $normalize->($new_review->{summary} || '');
+    return 0 unless length $new_summary;
+
+    # Pull summary-shaped content out of the prior comment by extracting
+    # the first chunk after "Summary:" or "**Summary:**". Fall back to
+    # the full prior message if those headers aren't present.
+    my $prior_summary = $prior_message;
+    if ($prior_message =~ /(?:^|\n)(?:\*\*)?Summary:?\*?\*?\s*(.{0,800})/s) {
+        $prior_summary = $1;
+    }
+    $prior_summary = $normalize->($prior_summary);
+
+    return 0 unless length $prior_summary;
+
+    # Truncate to a comparable window and use a Jaccard-like token
+    # similarity. If the first ~200 normalized chars of each share
+    # >= 65% of their tokens, the new review is effectively a restatement
+    # of the prior one and we skip posting to avoid emitting a duplicate
+    # bot comment that doesn't add anything the user hasn't already seen.
+    my $new_short = substr($new_summary, 0, 200);
+    my $prior_short = substr($prior_summary, 0, 200);
+
+    my %new_tokens = map { $_ => 1 } split /\s+/, $new_short;
+    my %prior_tokens = map { $_ => 1 } split /\s+/, $prior_short;
+    my $new_count = scalar(keys %new_tokens);
+    my $prior_count = scalar(keys %prior_tokens);
+    return 0 unless $new_count || $prior_count;
+
+    my $shared = 0;
+    for my $t (keys %new_tokens) {
+        $shared++ if $prior_tokens{$t};
+    }
+    # Jaccard = |A intersect B| / |A union B|
+    my $union = $new_count + $prior_count - $shared;
+    return 0 unless $union;
+
+    my $jaccard = $shared / $union;
+
+    return $jaccard >= 0.65 ? 1 : 0;
+}
+
 =head2 _is_bot_mention
 
 Detect whether a comment body contains a direct @-mention of the bot.
@@ -1344,6 +1455,136 @@ sub _log {
     my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
     print STDERR "[$timestamp][$level][PRMonitor] $msg\n";
 }
+
+1;
+
+__END__
+
+=head1 AUTHOR
+
+CLIO Development Team
+
+=head1 LICENSE
+
+GPL-3.0-only
+
+=cut
+
+=head2 _is_substantively_same
+
+Compare a new review to the bot's prior response and decide whether the
+new review would just restate the same conclusion. Used to avoid posting
+duplicate near-identical reviews when a user comment didn't actually
+change anything material.
+
+Returns 1 if the recommendation, summary, and key findings all match the
+prior response, 0 otherwise.
+
+=cut
+
+sub _is_substantively_same {
+    my ($self, $new_review, $prior_message) = @_;
+
+    return 0 unless $new_review && $prior_message && length $prior_message;
+
+    # Normalize: strip markdown emphasis, drop the standard CLIO footer,
+    # collapse whitespace, lowercase. This compares the actual content
+    # rather than markdown noise.
+    my $normalize = sub {
+        my $s = shift || '';
+        $s =~ s/[`*_]//g;
+        $s =~ s/\s+/ /g;
+        # Strip the standard CLIO footer that follows every review comment.
+        $s =~ s/\s*this is an automated review\.\s*a human maintainer will provide final approval\.\s*//i;
+        $s =~ s/\s*automated\s+review[\s\w.]*//i;
+        $s = lc($s);
+        $s =~ s/^\s+|\s+\z//g;
+        return $s;
+    };
+
+    # Extract summary and key content from new review
+    my $new_summary = $normalize->($new_review->{summary} || '');
+    my $new_recommendation = $normalize->($new_review->{recommendation} || '');
+    my $new_findings = '';
+    if ($new_review->{file_comments} && ref($new_review->{file_comments}) eq 'ARRAY') {
+        for my $fc (@{$new_review->{file_comments}}) {
+            if ($fc->{findings} && ref($fc->{findings}) eq 'ARRAY') {
+                for my $finding (@{$fc->{findings}}) {
+                    $new_findings .= $normalize->($finding->{description} || '') . ' ';
+                }
+            }
+        }
+    }
+    my $new_content = $new_summary . ' ' . $new_recommendation . ' ' . $new_findings;
+    $new_content =~ s/\s+/ /g;
+    $new_content =~ s/^\s+|\s+\z//g;
+    
+    return 0 unless length $new_content;
+
+    # Extract summary from prior message
+    my $prior_summary = $prior_message;
+    if ($prior_message =~ /(?:^|\n)(?:\*\*)?Summary:?\*?\*?\s*(.{0,800})/s) {
+        $prior_summary = $1;
+    }
+    $prior_summary = $normalize->($prior_summary);
+
+    return 0 unless length $prior_summary;
+
+    # Truncate to a comparable window and use a Jaccard-like token
+    # similarity. If the first ~200 normalized chars of each share
+    # >= 65% of their tokens, the new review is effectively a restatement
+    # of the prior one and we skip posting to avoid emitting a duplicate
+    # bot comment that doesn't add anything the user hasn't already seen.
+    my $new_short = substr($new_content, 0, 200);
+    my $prior_short = substr($prior_summary, 0, 200);
+
+    my %new_tokens = map { $_ => 1 } split /\s+/, $new_short;
+    my %prior_tokens = map { $_ => 1 } split /\s+/, $prior_short;
+    my $new_count = scalar(keys %new_tokens);
+    my $prior_count = scalar(keys %prior_tokens);
+    return 0 unless $new_count || $prior_count;
+
+    my $shared = 0;
+    for my $t (keys %new_tokens) {
+        $shared++ if $prior_tokens{$t};
+    }
+    # Jaccard = |A intersect B| / |A union B|
+    my $union = $new_count + $prior_count - $shared;
+    return 0 unless $union;
+
+    my $jaccard = $shared / $union;
+
+    return $jaccard >= 0.65 ? 1 : 0;
+}
+
+=head2 _log
+
+Log a message with timestamp and level.
+
+=cut
+
+sub _log {
+    my ($self, $level, $msg) = @_;
+    
+    return if $level eq 'DEBUG' && !$self->{debug};
+    
+    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    print STDERR "[$timestamp][$level][PRMonitor] $msg\n";
+}
+
+1;
+
+__END__
+
+=head1 AUTHOR
+
+CLIO Development Team
+
+=head1 LICENSE
+
+GPL-3.0-only
+
+=cut
 
 1;
 
