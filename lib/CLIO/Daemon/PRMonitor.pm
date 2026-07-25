@@ -227,23 +227,41 @@ sub _poll_repo {
     
     for my $pr (@$prs) {
         my $pr_id = "pr:$owner/$name#$pr->{number}";
-        
+
+        # Reset per-PR flags. _mention_triggered is set later when a direct
+        # @-mention is detected, bypassing cooldown/cap/last-review gates.
+        $self->{_mention_triggered} = 0;
+        $self->{_mention_request_body} = '';
+
         # Skip draft PRs
         if ($pr->{draft}) {
             $self->_log("DEBUG", "Skipping PR #$pr->{number} (draft)");
             next;
         }
-        
+
         # Skip bot PRs
         if ($pr->{user} && $pr->{user}{type} eq 'Bot') {
             $self->_log("DEBUG", "Skipping PR #$pr->{number} (bot)");
             $self->{state}->record_check($pr_id, 'skip-bot');
             next;
         }
-        
+
         # Check if we've already responded to this PR (authoritative DB check)
         my $last_response_time = $self->{state}->get_last_response($pr_id);
         if ($last_response_time) {
+            # Direct @-mention of CLIO bypasses cooldown and the no-new-
+            # activity skip. A user explicitly addressing the bot is an
+            # authoritative re-review request.
+            my $mention_body = $self->_find_mention_since(
+                $owner, $name, $pr->{number}, $last_response_time
+            );
+            my $has_mention = length $mention_body ? 1 : 0;
+            if ($has_mention) {
+                $self->{_mention_triggered} = 1;
+                $self->{_mention_request_body} = $mention_body;
+                $self->_log("INFO", "PR #$pr->{number} directly addressed - bypassing cooldown");
+            }
+
             # We already posted a review. Check if there are new commits.
             my $has_new_commits = 0;
             # Get the SHA from the most recent response (not from discussion_checks,
@@ -255,9 +273,10 @@ sub _poll_repo {
                     $has_new_commits = 1;
                 }
             }
-            
-            # Only re-review if there are new commits since our last review
-            unless ($has_new_commits) {
+
+            # Only re-review if there are new commits since our last review,
+            # new user activity, or a direct @-mention of CLIO.
+            unless ($has_new_commits || $has_mention) {
                 # Also check for new user comments since our response
                 if (!$self->_has_new_user_comments($owner, $name, $pr->{number}, $last_response_time)) {
                     $self->_log("DEBUG", "Skipping PR #$pr->{number} (already reviewed, no new commits or user activity)");
@@ -265,17 +284,22 @@ sub _poll_repo {
                     next;
                 }
             }
-            
-            # Apply cooldown even for new commits/activity
-            my $age = time() - $last_response_time;
-            my $cooldown = ($self->{config}{pr_cooldown_minutes} || 30) * 60;
-            if ($age < $cooldown) {
-                $self->_log("DEBUG", "Skipping PR #$pr->{number} (in cooldown, ${age}s ago)");
-                next;
+
+            # Apply cooldown even for new commits/activity, unless the user
+            # directly @-mentioned the bot.
+            unless ($has_mention) {
+                my $age = time() - $last_response_time;
+                my $cooldown = ($self->{config}{pr_cooldown_minutes} || 30) * 60;
+                if ($age < $cooldown) {
+                    $self->_log("DEBUG", "Skipping PR #$pr->{number} (in cooldown, ${age}s ago)");
+                    next;
+                }
             }
-            
+
             $self->_log("INFO", "Re-reviewing PR #$pr->{number} (" .
-                ($has_new_commits ? "new commits" : "new user activity") . ")");
+                ($has_new_commits ? "new commits"
+                 : $has_mention ? "direct @-mention"
+                 : "new user activity") . ")");
         } else {
             # Never responded - apply check cooldown to avoid rapid rechecks
             my $last_check = $self->{state}->get_last_check($pr_id);
@@ -288,9 +312,10 @@ sub _poll_repo {
                 }
             }
         }
-        
+
         # Skip if last review comment is from CLIO/bot or maintainer (live API check)
-        # BUT: if a maintainer requested re-review, don't skip
+        # BUT: if a maintainer requested re-review OR the bot was directly
+        # @-mentioned, don't skip.
         my $re_review_requested = 0;
         if ($last_response_time) {
             my $re_review_ctx = $self->_get_re_review_context($owner, $name, $pr->{number}, $last_response_time);
@@ -299,8 +324,8 @@ sub _poll_repo {
                 $self->_log("INFO", "Re-review requested by maintainer for PR #$pr->{number}");
             }
         }
-        
-        if (!$re_review_requested && $self->_last_review_is_from_bot($owner, $name, $pr->{number})) {
+
+        if (!$re_review_requested && !$self->{_mention_triggered} && $self->_last_review_is_from_bot($owner, $name, $pr->{number})) {
             $self->_log("DEBUG", "Skipping PR #$pr->{number} (last comment from bot or maintainer)");
             $self->{state}->record_check($pr_id, 'skip-bot-reviewed');
             next;
@@ -407,6 +432,19 @@ sub _review_pr {
         $context->{re_review} = 1;
         $context->{re_review_request} = $re_review_context;
     }
+
+    # Surface direct @-mention as a distinct signal so the analyzer
+    # treats it as an authoritative correction rather than a generic
+    # comment in the activity list.
+    if ($self->{_mention_triggered} && length($self->{_mention_request_body})) {
+        $context->{mention_triggered} = 1;
+        $context->{mention_request} = $self->{_mention_request_body};
+        # Treat a mention as a re-review too so the prompt's
+        # re-review framing applies.
+        $context->{re_review} = 1;
+        $context->{re_review_request} = $self->{_mention_request_body}
+            unless $context->{re_review_request};
+    }
     
     # Run analysis
     my $result = $self->{analyzer}->analyze($context);
@@ -509,13 +547,19 @@ sub _format_review_comment {
     }
     
     my $header = $is_update ? "CLIO Automated Review (Updated)" : "CLIO Automated Review";
-    
+
     # Indicate if this was a requested re-review
     my $is_re_review = $review->{_re_review} || 0;
     if ($is_re_review) {
         $header = "CLIO Automated Re-Review (Requested)";
     }
-    
+
+    # Direct @-mention of CLIO gets a distinct header so the user can see
+    # at a glance that the bot heard them.
+    if ($self->{_mention_triggered}) {
+        $header = "CLIO Automated Re-Review (Direct Reply)";
+    }
+
     my $comment = "## $emoji $header: $verdict\n\n";
     $comment .= "**Summary:** $summary\n\n";
     $comment .= "| Metric | Value |\n|--------|-------|\n";
@@ -658,10 +702,12 @@ sub _build_pr_context {
     }
     
     my $context = {
-        type       => 'pull_request',
-        repo       => "$owner/$name",
-        repos_path => $repo_path,
-        discussion => {
+        type              => 'pull_request',
+        repo              => "$owner/$name",
+        repos_path        => $repo_path,
+        mention_triggered => $self->{_mention_triggered} ? 1 : 0,
+        mention_request   => $self->{_mention_request_body} || '',
+        discussion        => {
             number   => $number,
             title    => $pr->{title},
             body     => $pr->{body} || '',
@@ -1024,47 +1070,88 @@ sub _has_new_user_comments {
 
 Check if a comment body contains a re-review request.
 
-Recognized patterns (case-insensitive):
+Recognised patterns (case-insensitive):
 - "re-review" / "re review" / "rereview"
 - "please re-review" / "re-review this"
-- "@clio-bot re-review" / "@clio re-review"
 - "review again" / "review this again"
 - "recheck" / "re-check"
+- any direct @-mention of the bot (@clio, @clio-bot, @clio_bot, @<bot_username>)
+
+Bare @-mentions count as re-review requests regardless of accompanying
+keywords. A user who @-pings the bot has explicitly asked for engagement.
 
 =cut
 
 sub _is_re_review_request {
     my ($self, $body) = @_;
     return 0 unless defined $body && length($body);
-    
+
     # Normalize whitespace for matching
     my $normalized = $body;
     $normalized =~ s/\s+/ /g;
-    
+
     # Match re-review patterns
     return 1 if $normalized =~ /\bre-?\s*review\b/i;
     return 1 if $normalized =~ /\brereview\b/i;
     return 1 if $normalized =~ /\breview\s+again\b/i;
     return 1 if $normalized =~ /\bre-?\s*check\b/i;
     return 1 if $normalized =~ /\brecheck\b/i;
-    
+
+    # Bare @-mention of the bot is a re-review request in itself.
+    return 1 if $self->_is_bot_mention($body);
+
     return 0;
 }
 
-=head2 _get_re_review_context
+=head2 _is_bot_mention
 
-Extract re-review context from maintainer comments since a given timestamp.
-Returns the body of the most recent re-review request, or empty string.
+Detect whether a comment body contains a direct @-mention of the bot.
+
+Recognises (case-insensitive):
+- @<configured bot_username>
+- @clio-bot / @clio_bot / @cliobot
+- @clio (alone)
+
+The @ must be preceded by a non-word character (or start of string) so
+that email addresses and mid-word occurrences (e.g. "subclio") do not
+trigger.
 
 =cut
 
-sub _get_re_review_context {
+sub _is_bot_mention {
+    my ($self, $body) = @_;
+
+    return 0 unless defined $body && length($body);
+
+    my $bot_user = $self->{config}{bot_username} || '';
+    my $pattern;
+
+    if ($bot_user) {
+        $pattern = qr/(?:^|[^\w])\@(?:\Q$bot_user\E|clio(?:[-_]?bot)?)\b/i;
+    } else {
+        $pattern = qr/(?:^|[^\w])\@clio(?:[-_]?bot)?\b/i;
+    }
+
+    return $body =~ $pattern ? 1 : 0;
+}
+
+=head2 _find_mention_since
+
+Fetch comments since a timestamp and return the body of the most recent
+comment containing a bot mention, or empty string. Used to bypass
+cooldown gates when a user directly addresses the bot.
+
+Returns '' if no mention is found or the API call fails.
+
+=cut
+
+sub _find_mention_since {
     my ($self, $owner, $name, $number, $since_ts) = @_;
-    
+
     local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
-    
+
     my $since_iso = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($since_ts));
-    
+
     my $s_owner  = _safe_shell_arg($owner);
     my $s_name   = _safe_shell_arg($name);
     my $s_number = _safe_shell_arg($number);
@@ -1072,24 +1159,94 @@ sub _get_re_review_context {
     my $cmd = qq{gh api "repos/$s_owner/$s_name/issues/$s_number/comments?since=$s_since&per_page=100" 2>/dev/null};
     my $response = `$cmd`;
     return '' if $? != 0;
-    
+
     my $data;
     eval { $data = decode_json($response); };
     return '' if $@ || ref($data) ne 'ARRAY';
-    
+
+    my $bot_user = $self->{config}{bot_username} || '';
+
+    # Walk newest -> oldest so we return the most recent mention.
+    for my $comment (reverse @$data) {
+        my $author = $comment->{user}{login} || '';
+
+        # The bot cannot @-mention itself in a way that should retrigger
+        # its own analysis. Skip self-authored comments defensively.
+        next if $bot_user && $author eq $bot_user;
+        next if $author =~ /clio/i;
+        next if $author =~ /\[bot\]$/;
+        next if $author eq 'github-actions';
+
+        if ($self->_is_bot_mention($comment->{body} || '')) {
+            return $comment->{body} || '';
+        }
+    }
+
+    return '';
+}
+
+=head2 _get_re_review_context
+
+Extract re-review context from comments since a given timestamp.
+Returns the body of the most recent re-review request or bot mention,
+or empty string.
+
+Looks for both:
+- Re-review keyword patterns from maintainers (legacy behaviour)
+- Direct @-mentions of the bot from any user (the new path - lets
+  contributors, not just maintainers, summon the bot by @-pinging it)
+
+The mention path takes precedence because it is the more explicit signal
+of user intent.
+
+=cut
+
+sub _get_re_review_context {
+    my ($self, $owner, $name, $number, $since_ts) = @_;
+
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+
+    my $since_iso = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($since_ts));
+
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $s_since  = _safe_shell_arg($since_iso);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/issues/$s_number/comments?since=$s_since&per_page=100" 2>/dev/null};
+    my $response = `$cmd`;
+    return '' if $? != 0;
+
+    my $data;
+    eval { $data = decode_json($response); };
+    return '' if $@ || ref($data) ne 'ARRAY';
+
     my $maintainers = $self->{config}{maintainers} || [];
     my $bot_user = $self->{config}{bot_username} || '';
-    
-    # Find the most recent re-review request from a maintainer
+
+    # First pass: look for any direct @-mention of the bot from any user.
+    # Most recent mention wins.
+    for my $comment (reverse @$data) {
+        my $author = $comment->{user}{login} || '';
+        next if $bot_user && $author eq $bot_user;
+        next if $author =~ /clio/i;
+        next if $author =~ /\[bot\]$/;
+        next if $author eq 'github-actions';
+
+        if ($self->_is_bot_mention($comment->{body} || '')) {
+            return $comment->{body};
+        }
+    }
+
+    # Second pass: fall back to legacy maintainer-only re-review requests.
     for my $comment (reverse @$data) {
         my $author = $comment->{user}{login} || '';
         next unless grep { $_ eq $author } @$maintainers;
-        
+
         if ($self->_is_re_review_request($comment->{body} || '')) {
             return $comment->{body};
         }
     }
-    
+
     return '';
 }
 

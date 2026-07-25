@@ -170,8 +170,19 @@ sub _build_discussion_prompt {
         @comments = @filtered;
     }
 
-    # Build conversation thread
-    my $thread = "## Discussion Thread\n\n";
+    # Build conversation thread. Direct @-mention of CLIO goes ABOVE
+    # everything else so the model engages with it as an authoritative
+    # correction rather than burying it in the activity list.
+    my $thread = '';
+
+    if ($context->{mention_triggered} && length($context->{mention_request} || '')) {
+        $thread .= "### Direct @-mention of CLIO\n\n";
+        $thread .= "A user explicitly @-mentioned the bot. Treat the following message as authoritative feedback that demands a response:\n\n";
+        $thread .= "> " . $context->{mention_request} . "\n\n";
+        $thread .= "If the user is correcting your prior triage, acknowledge the correction explicitly. If the user provides new evidence (a commit, link, or claim), engage with it on its merits - do not reassert the prior recommendation without addressing what they said. Lower your prior confidence if their evidence contradicts your earlier findings. CLIO cannot dereference URLs in the message above; treat any link as a pointer the user is making, not as content you can read.\n\n";
+    }
+
+    $thread .= "## Discussion Thread\n\n";
     $thread .= "**Repository:** $context->{repo}\n";
     $thread .= "**Discussion #$disc->{number}:** $disc->{title}\n";
     $thread .= "**Category:** $disc->{category}\n";
@@ -259,6 +270,16 @@ sub _build_pr_prompt {
     $pr_context .= "**Base:** `$disc->{base}` <- **Head:** `$disc->{head}`\n";
     $pr_context .= "**Head SHA:** `$disc->{head_sha}`\n\n";
     
+    # Direct @-mention of CLIO in a recent comment. Surface this ABOVE
+    # everything else so the model engages with it as an authoritative
+    # correction rather than burying it in the activity list.
+    if ($context->{mention_triggered} && length($context->{mention_request} || '')) {
+        $pr_context .= "**CLIO WAS DIRECTLY ADDRESSED IN A RECENT COMMENT.**\n\n";
+        $pr_context .= "A user explicitly @-mentioned the bot. Treat the following message as authoritative feedback that demands a response - not a casual follow-up:\n\n";
+        $pr_context .= "> " . $context->{mention_request} . "\n\n";
+        $pr_context .= "If the user is correcting a prior review, acknowledge the correction explicitly. If the user provides new evidence (a commit, link, or claim), engage with it on its merits - do not reassert the prior conclusion without addressing what they said. Lower your prior confidence if their evidence contradicts your earlier findings.\n\n";
+    }
+
     # Re-review context
     if ($context->{re_review}) {
         $pr_context .= "**THIS IS A RE-REVIEW REQUESTED BY A MAINTAINER.**\n\n";

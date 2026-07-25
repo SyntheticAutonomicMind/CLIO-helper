@@ -237,6 +237,8 @@ sub _poll_repo {
         # Reset per-issue flags. _re_analysis is set later if we've already
         # posted to this issue and new user activity is detected.
         $self->{_re_analysis} = 0;
+        $self->{_mention_triggered} = 0;
+        $self->{_mention_request_body} = '';
 
         # Skip if already has classification labels
         if ($self->_has_triage_labels($issue)) {
@@ -255,32 +257,45 @@ sub _poll_repo {
         # Check if we've already responded to this issue (authoritative DB check)
         my $last_response_time = $self->{state}->get_last_response($issue_id);
         if ($last_response_time) {
-            # We already posted a response. Only re-process if there's new
-            # user activity on the issue since our response AND cooldown passed.
-            my $age = time() - $last_response_time;
-            my $cooldown = ($self->{config}{issue_cooldown_minutes} || 60) * 60;
-            if ($age < $cooldown) {
-                $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, cooldown ${age}s)");
-                next;
-            }
+            # Direct @-mention of CLIO bypasses cooldown, response cap, and
+            # the activity check. A user explicitly addressing the bot is an
+            # authoritative request to re-analyze; silencing it because the
+            # bot spoke recently is the exact failure mode this hook exists
+            # to prevent.
+            my $mention_body = $self->_find_mention_since(
+                $owner, $name, $issue->{number}, $last_response_time
+            );
+            if (length $mention_body) {
+                $self->{_mention_triggered} = 1;
+                $self->{_mention_request_body} = $mention_body;
+                $self->_log("INFO", "Issue #$issue->{number} directly addressed - bypassing cooldown/cap");
+            } else {
+                # Apply cooldown if no mention
+                my $age = time() - $last_response_time;
+                my $cooldown = ($self->{config}{issue_cooldown_minutes} || 60) * 60;
+                if ($age < $cooldown) {
+                    $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, cooldown ${age}s)");
+                    next;
+                }
 
-            # Cap: don't re-triage beyond max_responses_per_issue. Prevents
-            # the bot from posting another near-duplicate analysis when
-            # the conversation keeps cycling on an issue where a user
-            # comment didn't materially change anything.
-            my $max_responses = $self->{config}{max_responses_per_issue} || 2;
-            my $response_count = $self->{state}->get_response_count($issue_id);
-            if ($response_count >= $max_responses) {
-                $self->_log("INFO", "Skipping issue #$issue->{number} (cap reached: $response_count/$max_responses responses)");
-                $self->{state}->record_check($issue_id, 'skip-response-cap');
-                next;
-            }
+                # Cap: don't re-triage beyond max_responses_per_issue. Prevents
+                # the bot from posting another near-duplicate analysis when
+                # the conversation keeps cycling on an issue where a user
+                # comment didn't materially change anything.
+                my $max_responses = $self->{config}{max_responses_per_issue} || 2;
+                my $response_count = $self->{state}->get_response_count($issue_id);
+                if ($response_count >= $max_responses) {
+                    $self->_log("INFO", "Skipping issue #$issue->{number} (cap reached: $response_count/$max_responses responses)");
+                    $self->{state}->record_check($issue_id, 'skip-response-cap');
+                    next;
+                }
 
-            # Cooldown passed - but only re-process if there's new user activity
-            if (!$self->_has_new_user_comments($owner, $name, $issue->{number}, $last_response_time)) {
-                $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, no new user activity)");
-                $self->{state}->record_check($issue_id, 'skip-already-responded');
-                next;
+                # Cooldown passed - but only re-process if there's new user activity
+                if (!$self->_has_new_user_comments($owner, $name, $issue->{number}, $last_response_time)) {
+                    $self->_log("DEBUG", "Skipping issue #$issue->{number} (already responded, no new user activity)");
+                    $self->{state}->record_check($issue_id, 'skip-already-responded');
+                    next;
+                }
             }
 
             $self->_log("INFO", "Re-checking issue #$issue->{number} (new user activity since our response)");
@@ -299,10 +314,15 @@ sub _poll_repo {
         }
         
         # Skip if last comment is from CLIO/bot or maintainer (live API check)
-        if ($self->_last_comment_is_from_bot($owner, $name, $issue->{number})) {
-            $self->_log("DEBUG", "Skipping issue #$issue->{number} (last comment from bot/maintainer)");
-            $self->{state}->record_check($issue_id, 'skip-bot-replied');
-            next;
+        # Bypassed when a direct @-mention was detected above: the user's
+        # mention IS the signal that re-analysis is wanted, regardless of
+        # who currently holds the last-comment slot.
+        unless ($self->{_mention_triggered}) {
+            if ($self->_last_comment_is_from_bot($owner, $name, $issue->{number})) {
+                $self->_log("DEBUG", "Skipping issue #$issue->{number} (last comment from bot/maintainer)");
+                $self->{state}->record_check($issue_id, 'skip-bot-replied');
+                next;
+            }
         }
         
         # Claim this issue before starting (prevents double-post if cycles overlap)
@@ -470,7 +490,9 @@ sub _triage_issue {
     # new triage would be substantively identical to the prior response,
     # skip posting to avoid posting a duplicate of the bot's own comment
     # when a user's follow-up didn't actually change anything material.
-    if ($triage && $self->{_re_analysis} && $context->{prior_response}) {
+    # Bypassed when the user directly @-mentioned CLIO: if someone took
+    # the trouble to address the bot, they want a response, not silence.
+    if ($triage && $self->{_re_analysis} && $context->{prior_response} && !$self->{_mention_triggered}) {
         if ($self->_is_substantively_same($triage, $context->{prior_response})) {
             $self->_log("INFO", "Skipping follow-up comment: no substantive change from prior response");
             $self->{state}->record_check($issue_id, 'skip-no-change');
@@ -545,6 +567,8 @@ sub _build_issue_context {
         repo              => "$owner/$name",
         repos_path        => $repo_path,
         re_analysis       => $self->{_re_analysis} ? 1 : 0,
+        mention_triggered => $self->{_mention_triggered} ? 1 : 0,
+        mention_request   => $self->{_mention_request_body} || '',
         prior_response    => $prior_message,
         prior_response_posted_at => $prior_posted_at,
         bot_username      => $self->{config}{bot_username} || '',
@@ -680,21 +704,103 @@ sub _has_new_user_comments {
     
     for my $comment (@$data) {
         my $author = $comment->{user}{login} || '';
-        
+
         # Skip bot comments
         next if $author =~ /clio/i;
         next if $author =~ /\[bot\]$/;
         next if $author eq 'github-actions';
         next if $bot_user && $author eq $bot_user;
-        
+
         # Skip maintainer comments (maintainers handle it themselves)
         next if grep { $_ eq $author } @$maintainers;
-        
+
         # Found a new user comment since our response
         return 1;
     }
-    
+
     return 0;
+}
+
+=head2 _is_bot_mention
+
+Detect whether a comment body contains a direct @-mention of the bot.
+
+Recognises (case-insensitive):
+- @<configured bot_username>
+- @clio-bot / @clio_bot / @cliobot
+- @clio (alone)
+
+The @ must be preceded by a non-word character (or start of string) so
+that email addresses and mid-word occurrences (e.g. "subclio") do not
+trigger. Used to let any user summon the bot by @-mentioning it,
+not just maintainers.
+
+=cut
+
+sub _is_bot_mention {
+    my ($self, $body) = @_;
+
+    return 0 unless defined $body && length($body);
+
+    my $bot_user = $self->{config}{bot_username} || '';
+    my $pattern;
+
+    if ($bot_user) {
+        $pattern = qr/(?:^|[^\w])\@(?:\Q$bot_user\E|clio(?:[-_]?bot)?)\b/i;
+    } else {
+        $pattern = qr/(?:^|[^\w])\@clio(?:[-_]?bot)?\b/i;
+    }
+
+    return $body =~ $pattern ? 1 : 0;
+}
+
+=head2 _find_mention_since
+
+Fetch comments since a timestamp and return the body of the most recent
+comment containing a bot mention, or empty string. Used to bypass
+cooldown/response-cap gates when a user directly addresses the bot.
+
+Returns '' if no mention is found or the API call fails.
+
+=cut
+
+sub _find_mention_since {
+    my ($self, $owner, $name, $number, $since_ts) = @_;
+
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+
+    my $since_iso = POSIX::strftime("%Y-%m-%dT%H:%M:%SZ", gmtime($since_ts));
+
+    my $s_owner  = _safe_shell_arg($owner);
+    my $s_name   = _safe_shell_arg($name);
+    my $s_number = _safe_shell_arg($number);
+    my $s_since  = _safe_shell_arg($since_iso);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name/issues/$s_number/comments?since=$s_since&per_page=100" 2>/dev/null};
+    my $response = `$cmd`;
+    return '' if $? != 0;
+
+    my $data;
+    eval { $data = decode_json($response); };
+    return '' if $@ || ref($data) ne 'ARRAY';
+
+    # Walk newest -> oldest so we return the most recent mention.
+    for my $comment (reverse @$data) {
+        my $author = $comment->{user}{login} || '';
+
+        # The bot cannot @-mention itself in a way that should retrigger
+        # its own analysis. Skip self-authored comments defensively.
+        my $bot_user = $self->{config}{bot_username} || '';
+        next if $bot_user && $author eq $bot_user;
+        next if $author =~ /clio/i;
+        next if $author =~ /\[bot\]$/;
+        next if $author eq 'github-actions';
+
+        if ($self->_is_bot_mention($comment->{body} || '')) {
+            return $comment->{body} || '';
+        }
+    }
+
+    return '';
 }
 
 =head2 _fetch_issue_events
@@ -880,8 +986,11 @@ sub _apply_triage {
     # Whether this is a follow-up to our own prior response. Used by the
     # comment formatters to label the comment as a follow-up rather than
     # re-emit an "Automated Triage Summary" header that looks like a fresh
-    # triage to readers.
+    # triage to readers. When the user directly @-mentioned CLIO, label
+    # the response as a direct reply so the user can see the bot heard
+    # them.
     my $followup = $self->{_re_analysis} ? 1 : 0;
+    my $mention_reply = $self->{_mention_triggered} ? 1 : 0;
 
     if ($rec eq 'close') {
         $self->_post_close_comment($owner, $name, $number, $triage);
@@ -890,7 +999,7 @@ sub _apply_triage {
     } elsif ($rec eq 'already-addressed') {
         $self->_post_addressed_comment($owner, $name, $number, $triage);
     } else {
-        $self->_post_triage_comment($owner, $name, $number, $triage, $followup);
+        $self->_post_triage_comment($owner, $name, $number, $triage, $followup, $mention_reply);
     }
 }
 
@@ -994,19 +1103,22 @@ Post a triage summary comment on the issue.
 =cut
 
 sub _post_triage_comment {
-    my ($self, $owner, $name, $number, $triage, $followup) = @_;
-    
+    my ($self, $owner, $name, $number, $triage, $followup, $mention_reply) = @_;
+
     my $classification = $triage->{classification} || 'unknown';
     my $priority = $triage->{priority} || 'medium';
     my $completeness = $triage->{completeness} || 'N/A';
     my $summary = $triage->{summary} || 'Issue triaged successfully.';
-    
-    my $comment = $followup
-        ? "## Follow-up Triage\n\n"
-        : "## Automated Triage Summary\n\n";
 
-    if ($followup) {
+    my $comment;
+    if ($mention_reply) {
+        $comment = "## Direct Reply (Re: @-mention)\n\n";
+        $comment .= "_CLIO-Bot was directly addressed in a recent comment. Re-engaged with the thread based on what you said._\n\n";
+    } elsif ($followup) {
+        $comment = "## Follow-up Triage\n\n";
         $comment .= "_Re-analysis triggered by new activity on this issue. Updated triage based on the latest comments._\n\n";
+    } else {
+        $comment = "## Automated Triage Summary\n\n";
     }
 
     $comment .= "| Field | Value |\n|-------|-------|\n";
