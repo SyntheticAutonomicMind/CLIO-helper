@@ -22,6 +22,7 @@ test:
 	@echo "Running tests..."
 	@$(PERL) -I./lib t/guardrails.t
 	@$(PERL) -I./lib t/bot_mention.t
+	@$(PERL) -I./lib t/prompt_discipline.t
 	@echo "All tests passed."
 
 release:

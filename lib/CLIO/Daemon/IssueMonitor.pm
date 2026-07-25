@@ -1131,10 +1131,10 @@ sub _post_triage_comment {
     if ($triage->{root_cause} && $triage->{root_cause}{hypothesis}) {
         my $rc = $triage->{root_cause};
         my $confidence = $rc->{confidence} || 'unknown';
-        
+
         $comment .= "### Root Cause Analysis\n\n";
         $comment .= "**Confidence:** \`$confidence\`\n\n";
-        
+
         # List affected files
         if ($rc->{files} && ref($rc->{files}) eq 'ARRAY' && @{$rc->{files}}) {
             $comment .= "**Relevant files:**\n";
@@ -1143,7 +1143,7 @@ sub _post_triage_comment {
             }
             $comment .= "\n";
         }
-        
+
         # List affected functions
         if ($rc->{functions} && ref($rc->{functions}) eq 'ARRAY' && @{$rc->{functions}}) {
             $comment .= "**Relevant functions:**\n";
@@ -1152,7 +1152,7 @@ sub _post_triage_comment {
             }
             $comment .= "\n";
         }
-        
+
         $comment .= "$rc->{hypothesis}\n\n";
     }
     
