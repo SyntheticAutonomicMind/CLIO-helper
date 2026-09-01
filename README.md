@@ -267,6 +267,9 @@ clio-helper --version
 
 # Use custom config
 clio-helper --config /path/to/config.json
+
+# Use a named routing profile (overrides config `route` and `model`)
+clio-helper --route my-route --once
 ```
 
 ## Configuration
@@ -290,6 +293,7 @@ Create `~/.clio/helper-config.json`:
     "github_token": "ghp_your_token_here",
     "posting_token": "",
     "model": "minimax/MiniMax-M3",
+    "route": "",
     "dry_run": false,
     "maintainers": ["your-username"]
 }
@@ -307,6 +311,7 @@ See `examples/config.example.json` for a full configuration reference with all o
 | `github_token` | `$GH_TOKEN` | GitHub personal access token |
 | `posting_token` | (none) | Separate token for posting comments (optional; falls back to `github_token`) |
 | `model` | `minimax/MiniMax-M3` | AI model in provider/model format (any CLIO-supported model) |
+| `route` | (empty) | Named routing profile from CLIO's `model_routes` config. When set, takes precedence over `model`. Use this for fallback routing across multiple models. |
 | `clio_path` | `clio` | Path to CLIO executable |
 | `dry_run` | false | Analyze without posting responses |
 | `maintainers` | `[]` | GitHub usernames to skip (they handle their own threads) |
@@ -364,6 +369,28 @@ In practice this means:
 - A bot with comment-only access still produces useful triage comments - labels and closes just get skipped.
 - A bot with `repo` scope (classic PAT) has full functionality on every monitor.
 - A fine-grained token scoped to a single repo can be given full functionality by granting `Issues: Read+Write`, `Pull Requests: Read+Write`, and `Metadata: Read`. Add `Administration: Write` only if you want the bot to create new label definitions.
+
+### Model Selection: `model` vs `route`
+
+Two configuration knobs control which AI model processes each request:
+
+- `model` - a single model in `provider/model` format. The default
+  `minimax/MiniMax-M3` is fine for most use cases.
+- `route` - a named routing profile defined in CLIO's own `model_routes`
+  config map (e.g. profiles that fan out across multiple free models with
+  automatic fallback). When `route` is set, it takes precedence over
+  `model`.
+
+You can also pass `--route <name>` on the command line to override the
+config for a single run. The CLI flag wins over both the config `route`
+field and the config `model` field.
+
+```
+clio-helper --route my-route --once --dry-run
+```
+
+If both `route` and `model` are set in config, `route` wins. If only
+`model` is set, behavior is identical to previous versions.
 
 ## Security and Guardrails
 

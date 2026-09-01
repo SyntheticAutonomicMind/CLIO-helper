@@ -22,6 +22,7 @@
     "github_token": "",
     "posting_token": "",
     "model": "minimax/MiniMax-M3",
+    "route": "",
     "clio_path": "clio",
     "dry_run": false,
     "maintainers": ["your-maintainer-username"],

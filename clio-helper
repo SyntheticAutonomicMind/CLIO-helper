@@ -24,6 +24,9 @@ clio-helper - GitHub monitoring daemon for discussions, issues, PRs, and more
     # Debug mode
     clio-helper --debug
 
+    # Use a named routing profile (overrides config `route` and `model`)
+    clio-helper --route my-route --once
+
 =head1 DESCRIPTION
 
 A daemon that continuously monitors GitHub repositories and uses CLIO AI
@@ -53,6 +56,7 @@ Create ~/.clio/helper-config.json:
         "poll_interval_seconds": 300,
         "github_token": "ghp_...",
         "model": "minimax/MiniMax-M3",
+        "route": "",
         "dry_run": false,
         "maintainers": ["your-maintainer-username"]
     }
@@ -97,6 +101,7 @@ my %opts = (
     help    => 0,
     version => 0,
     monitor => '',
+    route   => '',
 );
 
 GetOptions(
@@ -105,6 +110,7 @@ GetOptions(
     'once'      => \$opts{once},
     'dry-run'   => \$opts{dry_run},
     'monitor=s' => \$opts{monitor},
+    'route=s'   => \$opts{route},
     'stats'     => \$opts{stats},
     'help|h'    => \$opts{help},
     'version|v' => \$opts{version},
@@ -139,6 +145,9 @@ my $config = _load_config($config_file);
 # Apply command-line overrides
 $config->{dry_run} = 1 if $opts{dry_run};
 $config->{debug}   = 1 if $opts{debug};
+# CLI --route override beats config so operators can switch routes per run
+# without editing the config file. When set, route wins over model.
+$config->{route} = $opts{route} if length $opts{route};
 
 # Warn if the operator hasn't configured any repos to monitor. We no
 # longer ship a default repo list because the public helper agent is
@@ -270,6 +279,7 @@ sub _load_config {
     $config->{github_token}             //= $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '';
     $config->{posting_token}            //= $ENV{CLIO_POSTING_TOKEN} || '';
     $config->{model}                    //= 'minimax/MiniMax-M3';
+    $config->{route}                    //= '';
     $config->{dry_run}                  //= 0;
     $config->{maintainers}              //= [];
     $config->{state_file}               //= "$ENV{HOME}/.clio/helper-state.db";
@@ -491,6 +501,13 @@ __END__
 =item B<--config FILE>
 
 Path to configuration file (default: ~/.clio/helper-config.json)
+
+=item B<--route NAME>
+
+Use a named model routing profile for AI calls. Equivalent to setting
+C<route> in the config file; CLI override beats config. When B<route> is
+set, it takes precedence over B<model>. Available routes are those
+configured in CLIO's C<model_routes> map.
 
 =item B<--monitor TYPES>
 

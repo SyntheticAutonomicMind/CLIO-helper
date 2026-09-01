@@ -122,6 +122,7 @@ sub _init_analyzer {
 
     $self->{analyzer} = CLIO::Daemon::Analyzer->new(
         model         => $self->{config}{model} || 'minimax/MiniMax-M3',
+        route         => $self->{config}{route} || '',
         debug         => $self->{debug},
         clio_path     => $self->{config}{clio_path} || 'clio',
         repos_path    => $self->{config}{repos_dir} || '',

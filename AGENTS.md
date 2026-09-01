@@ -224,7 +224,7 @@ All modules in this project live under `CLIO::Daemon::*` namespace.
 
 **Use MiniMax for all sub-agents:**
 ```
-agent_operations(operation: "spawn", task: "...", working_dir: "./CLIO-helper", model: "minimax/minimax-m3")
+agent_operations(operation: "spawn", task: "...", working_dir: "./CLIO-helper", model: "minimax/MiniMax-M3")
 ```
 
 MiniMax-M3 via MiniMax is the recommended default for all standard tasks: investigation, QA, implementation, code review, refactoring, documentation.
@@ -241,6 +241,9 @@ find lib -name "*.pm" -exec perl -I./lib -c {} \;
 
 # 2. Test dry run (no actual posts)
 ./clio-helper --once --dry-run --debug
+
+# 2b. Test dry run with a routing profile (verifies --route plumbing)
+./clio-helper --once --dry-run --debug --route <name>
 
 # 3. Check daemon stats
 ./clio-helper --stats
@@ -395,6 +398,7 @@ $self->{dbh}->do(q{
 | `poll_interval_seconds` | 120 | Polling frequency |
 | `github_token` | `$GH_TOKEN` | GitHub personal access token |
 | `model` | `minimax/MiniMax-M3` | AI model in provider/model format |
+| `route` | (empty) | Named routing profile from CLIO's `model_routes` config. Takes precedence over `model` when set. CLI `--route` overrides config. |
 | `dry_run` | false | Analyze without posting |
 | `maintainers` | `[]` | Usernames to skip |
 | `max_response_age_hours` | 24 | Don't respond to old discussions |

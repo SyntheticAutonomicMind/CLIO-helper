@@ -58,6 +58,9 @@ Create a new Analyzer instance.
 
 Arguments (hash):
 - model: AI model name in provider/model format (default: minimax/MiniMax-M3)
+- route: Named routing profile to use instead of a single model. When set,
+         takes precedence over `model`. Route names match the keys in CLIO's
+         `model_routes` config map.
 - debug: Enable debug logging (default: 0)
 - clio_path: Path to CLIO executable (default: 'clio')
 - repos_path: Path to cloned repos for code context (optional)
@@ -71,6 +74,7 @@ sub new {
 
     my $self = {
         model         => $args{model} || 'minimax/MiniMax-M3',
+        route         => $args{route} || '',
         debug         => $args{debug} || 0,
         clio_path     => $args{clio_path} || 'clio',
         repos_path    => $args{repos_path} || '',   # Path to cloned repos for context
@@ -78,6 +82,16 @@ sub new {
         prompts_dir   => $args{prompts_dir} || '',  # Directory containing prompt files
         placeholders  => $args{placeholders} || {},  # {{KEY}} -> value substitutions
     };
+
+    # Resolve the effective invocation mode once. A non-empty `route` wins
+    # over `model` because the user explicitly named a routing profile -
+    # silently using the model would defeat the purpose. Operators who want
+    # single-model behaviour should leave `route` unset.
+    if (length $self->{route}) {
+        $self->{mode} = 'route';
+    } else {
+        $self->{mode} = 'model';
+    }
 
     bless $self, $class;
     return $self;
@@ -643,6 +657,37 @@ sub _run_clio {
     my $model = $self->{model};
     $repos_path ||= $self->{repos_path};
     
+    # Debug: Log prompt info
+    $self->_log("DEBUG", "Prompt length: " . length($prompt) . " chars");
+    $self->_log("DEBUG", "Prompt preview (first 200 chars): " . substr($prompt, 0, 200));
+    $self->_log("DEBUG", "Temp file: $temp_file");
+    $self->_log("DEBUG", "CLIO path: $clio");
+    $self->_log("DEBUG", "Invocation mode: $self->{mode}");
+    if ($self->{mode} eq 'route') {
+        $self->_log("DEBUG", "Route: $self->{route}");
+    } else {
+        $self->_log("DEBUG", "Model: $model");
+    }
+    $self->_log("DEBUG", "Repos path: " . ($repos_path || 'none'));
+    
+    # Check if CLIO binary exists
+    my $clio_path_resolved = $clio;
+    if ($clio !~ m{/}) {
+        # Not an absolute path, check in PATH
+        my $which = `which $clio 2>/dev/null`;
+        chomp $which;
+        if ($which) {
+            $clio_path_resolved = $which;
+            $self->_log("DEBUG", "CLIO resolved to: $clio_path_resolved");
+        } else {
+            $self->_log("WARN", "CLIO binary '$clio' not found in PATH");
+        }
+    } elsif (-x $clio) {
+        $self->_log("DEBUG", "CLIO binary found at: $clio");
+    } else {
+        $self->_log("WARN", "CLIO binary not executable at: $clio");
+    }
+    
     # If we have a repo path, run CLIO from that directory for code context
     my $cd_prefix = '';
     if ($repos_path && -d $repos_path) {
@@ -652,21 +697,36 @@ sub _run_clio {
     }
     
     # Pipe prompt to CLIO
-    # Note: stderr is discarded to avoid debug output corrupting JSON extraction
-    my $s_clio  = _safe_shell_arg($clio);
-    my $s_model = _safe_shell_arg($model);
-    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new --model "$s_model" --exit 2>/dev/null};
+    # Note: stderr is captured for debugging (not discarded)
+    my $s_clio = _safe_shell_arg($clio);
+
+    # Build the model-selection flag. The mode was resolved in new() so
+    # this is a dumb dispatch: route mode passes --route, model mode
+    # passes --model. clio rejects combining the two, so we always emit
+    # exactly one. _safe_shell_arg keeps both values inside a conservative
+    # allowlist so a misconfigured route name cannot inject arguments.
+    my ($sel_flag, $sel_value);
+    if ($self->{mode} eq 'route') {
+        ($sel_flag, $sel_value) = ('--route', $self->{route});
+    } else {
+        ($sel_flag, $sel_value) = ('--model', $model);
+    }
+    my $s_sel = _safe_shell_arg($sel_value);
+    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new $sel_flag "$s_sel" --exit 2>&1};
     
-    $self->_log("DEBUG", "Running CLIO analysis...");
+    $self->_log("DEBUG", "Executing command: $cmd");
     
     my $output = `$cmd`;
     my $exit_code = $? >> 8;
     
+    $self->_log("DEBUG", "CLIO exit code: $exit_code");
+    $self->_log("DEBUG", "CLIO output length: " . length($output));
+    $self->_log("DEBUG", "CLIO output preview (first 500 chars): " . substr($output, 0, 500));
+    
     if ($exit_code != 0) {
         $self->_log("WARN", "CLIO exited with code $exit_code");
+        $self->_log("WARN", "CLIO stderr/stdout: " . substr($output, 0, 1000));
     }
-    
-    $self->_log("DEBUG", "CLIO output length: " . length($output));
     
     # Clean up
     unlink $temp_file;

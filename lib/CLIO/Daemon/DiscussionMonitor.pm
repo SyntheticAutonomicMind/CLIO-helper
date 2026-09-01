@@ -169,6 +169,7 @@ sub _default_config {
        github_token => $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
        posting_token => $ENV{CLIO_POSTING_TOKEN} || '',  # Separate token for posting comments (optional)
        model => 'minimax/MiniMax-M3',
+       route => '',  # Named routing profile; takes precedence over `model` when set
        dry_run => 0,
        maintainers => [],
        bot_username => '',  # Bot's GitHub username (auto-detected if empty)
@@ -509,6 +510,8 @@ sub _fetch_discussions {
     $escaped_query =~ s/'/'\\''/g;
     $escaped_query =~ s/\n/ /g;
     
+    # Use the configured token via GH_TOKEN environment variable
+    local $ENV{GH_TOKEN} = $token;
     my $cmd = "gh api graphql -f query='$escaped_query' 2>&1";
     my $result = `$cmd`;
     my $exit_code = $? >> 8;
@@ -828,24 +831,35 @@ sub _process_item {
     
     # Get repo path for CLIO to work in (provides code context)
     my $repo_path = $self->_get_repo_path($owner, $repo);
+    $self->_log("DEBUG", "Repo path for CLIO context: " . ($repo_path || '(none)'));
+    if (length $self->{config}{route}) {
+        $self->_log("DEBUG", "CLIO route: $self->{config}{route} (route wins over model)");
+    } else {
+        $self->_log("DEBUG", "CLIO model: $self->{config}{model}");
+    }
+    $self->_log("DEBUG", "CLIO prompts_dir: " . ($self->{config}{prompts_dir} || '(default)'));
     
     # Use CLIO AI to analyze and generate response
     require CLIO::Daemon::Analyzer;
     my $analyzer = CLIO::Daemon::Analyzer->new(
         model        => $self->{config}{model},
+        route        => $self->{config}{route} || '',
         debug        => $self->{debug},
         repos_path   => $repo_path,  # Pass repo path for code context
         prompts_dir  => $self->{config}{prompts_dir},  # Custom prompts directory
         placeholders => $self->_build_placeholders(),
     );
+    $self->_log("DEBUG", "Analyzer created, calling analyze()...");
     
     my $analysis = $analyzer->analyze($context);
+    $self->_log("DEBUG", "Analyzer returned: " . ($analysis ? "defined" : "undef"));
     
     unless ($analysis && $analysis->{action}) {
         $self->_log("WARN", "Failed to analyze discussion #$disc->{number}");
         return;
     }
     
+    $self->_log("DEBUG", "Full analysis result: action=$analysis->{action}, reason=" . ($analysis->{reason} // 'none') . ", message_len=" . length($analysis->{message} // ''));
     $self->_log("INFO", "Analysis result: action=$analysis->{action}");
     
     # Skip if no action needed
