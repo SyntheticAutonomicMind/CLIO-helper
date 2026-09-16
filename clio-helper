@@ -57,6 +57,8 @@ Create ~/.clio/helper-config.json:
         "github_token": "ghp_...",
         "model": "minimax/MiniMax-M3",
         "route": "",
+        "clio_path": "clio",
+        "clio_timeout": 120,
         "dry_run": false,
         "maintainers": ["your-maintainer-username"]
     }
@@ -183,7 +185,14 @@ if ($enabled_monitors{discussions}) {
         config_file => $config_file,
         debug       => $opts{debug},
     );
-    $monitors{discussions}{config}{dry_run} = 1 if $config->{dry_run};
+    $monitors{discussions}{config}{dry_run}  = 1 if $config->{dry_run};
+    # DiscussionMonitor reads its own config file, so CLI overrides are
+    # NOT automatically propagated (unlike IssueMonitor/PRMonitor which
+    # receive the full config hash). Forward CLI-derived values that the
+    # operator may have set per-run without editing the config file.
+    $monitors{discussions}{config}{route}       = $config->{route}  if length $config->{route};
+    $monitors{discussions}{config}{clio_path}   = $config->{clio_path};
+    $monitors{discussions}{config}{clio_timeout} = $config->{clio_timeout};
 }
 
 if ($enabled_monitors{issues}) {
@@ -280,6 +289,7 @@ sub _load_config {
     $config->{posting_token}            //= $ENV{CLIO_POSTING_TOKEN} || '';
     $config->{model}                    //= 'minimax/MiniMax-M3';
     $config->{route}                    //= '';
+    $config->{clio_timeout}             //= 120;
     $config->{dry_run}                  //= 0;
     $config->{maintainers}              //= [];
     $config->{state_file}               //= "$ENV{HOME}/.clio/helper-state.db";

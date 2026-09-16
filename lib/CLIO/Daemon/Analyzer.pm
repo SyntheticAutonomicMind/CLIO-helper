@@ -61,6 +61,9 @@ Arguments (hash):
 - route: Named routing profile to use instead of a single model. When set,
          takes precedence over `model`. Route names match the keys in CLIO's
          `model_routes` config map.
+- timeout: Execution timeout in seconds for CLIO (default: 120). Prevents
+         the daemon from hanging when CLIO stalls on an unresponsive route
+         or model.
 - debug: Enable debug logging (default: 0)
 - clio_path: Path to CLIO executable (default: 'clio')
 - repos_path: Path to cloned repos for code context (optional)
@@ -75,6 +78,7 @@ sub new {
     my $self = {
         model         => $args{model} || 'minimax/MiniMax-M3',
         route         => $args{route} || '',
+        timeout       => $args{timeout} || 120,
         debug         => $args{debug} || 0,
         clio_path     => $args{clio_path} || 'clio',
         repos_path    => $args{repos_path} || '',   # Path to cloned repos for context
@@ -656,6 +660,7 @@ sub _run_clio {
     my $clio = $self->{clio_path};
     my $model = $self->{model};
     $repos_path ||= $self->{repos_path};
+    my $timeout_sec = $self->{timeout} || 120;
     
     # Debug: Log prompt info
     $self->_log("DEBUG", "Prompt length: " . length($prompt) . " chars");
@@ -712,12 +717,24 @@ sub _run_clio {
         ($sel_flag, $sel_value) = ('--model', $model);
     }
     my $s_sel = _safe_shell_arg($sel_value);
-    my $cmd = qq{${cd_prefix}cat "$temp_file" | $s_clio --new $sel_flag "$s_sel" --exit 2>&1};
+    $self->_log("DEBUG", "CLIO execution timeout: ${timeout_sec}s");
+    
+    # Wrap the command with `timeout` so a hung CLIO process (e.g. an
+    # unresponsive free-tier model in a routing profile) cannot stall the
+    # daemon indefinitely. GNU coreutils `timeout` sends SIGTERM after the
+    # duration; `-k 10` follows up with SIGKILL if the process hasn't exited
+    # within 10 additional seconds.
+    my $cmd = qq{${cd_prefix}timeout -k 10 $timeout_sec sh -c "cat '$temp_file' | $s_clio --new $sel_flag '$s_sel' --exit 2>&1"};
     
     $self->_log("DEBUG", "Executing command: $cmd");
     
     my $output = `$cmd`;
     my $exit_code = $? >> 8;
+    
+    if ($exit_code == 124) {
+        $self->_log("ERROR", "CLIO timed out after ${timeout_sec}s (mode: $self->{mode}, route: " . ($self->{route} || 'none') . ", model: $model)");
+        $self->_log("ERROR", "CLIO was likely stalled on an unresponsive model/route. Output before timeout: " . substr($output, 0, 500));
+    }
     
     $self->_log("DEBUG", "CLIO exit code: $exit_code");
     $self->_log("DEBUG", "CLIO output length: " . length($output));

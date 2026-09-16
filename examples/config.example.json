@@ -24,6 +24,7 @@
     "model": "minimax/MiniMax-M3",
     "route": "",
     "clio_path": "clio",
+    "clio_timeout": 120,
     "dry_run": false,
     "maintainers": ["your-maintainer-username"],
 

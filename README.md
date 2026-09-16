@@ -294,6 +294,8 @@ Create `~/.clio/helper-config.json`:
     "posting_token": "",
     "model": "minimax/MiniMax-M3",
     "route": "",
+    "clio_path": "clio",
+    "clio_timeout": 120,
     "dry_run": false,
     "maintainers": ["your-username"]
 }
@@ -313,6 +315,7 @@ See `examples/config.example.json` for a full configuration reference with all o
 | `model` | `minimax/MiniMax-M3` | AI model in provider/model format (any CLIO-supported model) |
 | `route` | (empty) | Named routing profile from CLIO's `model_routes` config. When set, takes precedence over `model`. Use this for fallback routing across multiple models. |
 | `clio_path` | `clio` | Path to CLIO executable |
+| `clio_timeout` | 120 | Timeout in seconds for CLIO execution (prevents hangs on unresponsive models/routes) |
 | `dry_run` | false | Analyze without posting responses |
 | `maintainers` | `[]` | GitHub usernames to skip (they handle their own threads) |
 

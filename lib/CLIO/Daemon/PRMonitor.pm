@@ -123,6 +123,7 @@ sub _init_analyzer {
     $self->{analyzer} = CLIO::Daemon::Analyzer->new(
         model         => $self->{config}{model} || 'minimax/MiniMax-M3',
         route         => $self->{config}{route} || '',
+        timeout       => $self->{config}{clio_timeout} || 120,
         debug         => $self->{debug},
         clio_path     => $self->{config}{clio_path} || 'clio',
         repos_path    => $self->{config}{repos_dir} || '',
@@ -475,8 +476,9 @@ sub _review_pr {
         if ($self->_is_substantively_same($review, $prior_message)) {
             $self->_log("INFO", "Skipping follow-up review: no substantive change from prior response");
             $self->{state}->record_check($pr_id, 'skip-no-change');
-            # Still record that we processed it so we don't keep retrying.
-            $self->{state}->record_response($pr_id, 'skip', 'no substantive change');
+            # record_check already prevents re-trying; do NOT call
+            # record_response with 'skip' - that would trap the PR as
+            # "already reviewed" on all future cycles.
             $self->_restore_branch();
             return;
         }

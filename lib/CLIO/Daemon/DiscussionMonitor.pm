@@ -170,6 +170,8 @@ sub _default_config {
        posting_token => $ENV{CLIO_POSTING_TOKEN} || '',  # Separate token for posting comments (optional)
        model => 'minimax/MiniMax-M3',
        route => '',  # Named routing profile; takes precedence over `model` when set
+       clio_path => 'clio',  # Path to CLIO executable
+       clio_timeout => 120,  # Timeout in seconds for CLIO execution
        dry_run => 0,
        maintainers => [],
        bot_username => '',  # Bot's GitHub username (auto-detected if empty)
@@ -844,7 +846,9 @@ sub _process_item {
     my $analyzer = CLIO::Daemon::Analyzer->new(
         model        => $self->{config}{model},
         route        => $self->{config}{route} || '',
+        timeout      => $self->{config}{clio_timeout} || 120,
         debug        => $self->{debug},
+        clio_path    => $self->{config}{clio_path} || 'clio',
         repos_path   => $repo_path,  # Pass repo path for code context
         prompts_dir  => $self->{config}{prompts_dir},  # Custom prompts directory
         placeholders => $self->_build_placeholders(),

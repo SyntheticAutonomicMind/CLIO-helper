@@ -124,6 +124,7 @@ sub _init_analyzer {
     $self->{analyzer} = CLIO::Daemon::Analyzer->new(
         model         => $self->{config}{model} || 'minimax/MiniMax-M3',
         route         => $self->{config}{route} || '',
+        timeout       => $self->{config}{clio_timeout} || 120,
         debug         => $self->{debug},
         clio_path     => $self->{config}{clio_path} || 'clio',
         repos_path    => $self->{config}{repos_dir} || '',
@@ -245,6 +246,18 @@ sub _poll_repo {
         if ($self->_has_triage_labels($issue)) {
             $self->_log("DEBUG", "Skipping issue #$issue->{number} (already triaged)");
             $self->{state}->record_check($issue_id, 'skip-already-triaged');
+            next;
+        }
+
+        # Skip old issues — don't respond to issues older than
+        # max_response_age_hours (default 24h). This prevents the bot
+        # from triaging stale issues that have already been archived or
+        # resolved upstream.
+        my $max_age_hours = $self->{config}{max_response_age_hours} || 24;
+        my $created_epoch = $self->_parse_iso8601($issue->{created_at});
+        if ($created_epoch && (time() - $created_epoch) > ($max_age_hours * 3600)) {
+            $self->_log("DEBUG", "Skipping issue #$issue->{number} (created >${max_age_hours}h ago)");
+            $self->{state}->record_check($issue_id, 'skip-old');
             next;
         }
         
@@ -401,6 +414,27 @@ sub _sync_repo {
             $self->_log("INFO", "Cloned $owner/$name to $repo_path");
         }
     }
+}
+
+=head2 _parse_iso8601
+
+Parse an ISO 8601 timestamp (e.g. 2026-09-07T10:24:21Z) to Unix epoch.
+Returns 0 on parse failure.
+
+=cut
+
+sub _parse_iso8601 {
+    my ($self, $ts) = @_;
+
+    return 0 unless $ts;
+
+    if ($ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+        require Time::Local;
+        my ($y, $m, $d, $h, $min, $s) = ($1, $2, $3, $4, $5, $6);
+        return Time::Local::timegm($s, $min, $h, $d, $m - 1, $y - 1900);
+    }
+
+    return 0;
 }
 
 =head2 _fetch_issues
@@ -560,8 +594,9 @@ sub _triage_issue {
         if ($self->_is_substantively_same($triage, $context->{prior_response})) {
             $self->_log("INFO", "Skipping follow-up comment: no substantive change from prior response");
             $self->{state}->record_check($issue_id, 'skip-no-change');
-            # Still record that we processed it so we don't keep retrying.
-            $self->{state}->record_response($issue_id, 'skip', 'no substantive change');
+            # record_check already prevents re-trying; do NOT call
+            # record_response with 'skip' - that would trap the issue as
+            # "already responded" on all future cycles.
             return;
         }
     }
@@ -575,8 +610,15 @@ sub _triage_issue {
     } else {
         $self->_log("WARN", "Could not extract triage JSON for #$number");
     }
-    
-    $self->{state}->record_response($issue_id, $result->{action}, $result->{message} || '');
+   
+   # Record the result. Skip actions do NOT post a comment, so they must
+   # use record_check (not record_response) to avoid permanently blocking
+   # the issue on future cycles.
+   if ($result->{action} eq 'skip') {
+       $self->{state}->record_check($issue_id, 'skip');
+   } else {
+       $self->{state}->record_response($issue_id, $result->{action}, $result->{message} || '');
+   }
 }
 
 =head2 _build_issue_context
