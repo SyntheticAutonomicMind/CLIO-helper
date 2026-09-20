@@ -703,7 +703,7 @@ CLIO-helper is part of [Synthetic Autonomic Mind](https://github.com/SyntheticAu
 
 - **[SAM](https://github.com/SyntheticAutonomicMind/SAM)** - Native macOS AI assistant with voice control, document analysis, and image generation
 - **[CLIO](https://github.com/SyntheticAutonomicMind/CLIO)** - AI code assistant for the terminal. Runs on macOS and Linux.
-- **[ALICE](https://github.com/SyntheticAutonomicMind/ALICE)** - GPU-accelerated image generation server with web interface and OpenAI-compatible API
+- **[ALICE](https://github.com/SyntheticAutonomicMind/ALICE)** - GPU-accelerated image and audio generation server with web interface and OpenAI-compatible API
 - **[SAM-Web](https://github.com/SyntheticAutonomicMind/SAM-web)** - Access SAM from iPad, iPhone, or any browser
 
 ---
