@@ -266,25 +266,27 @@ Return your triage as JSON:
 
 ```json
 {
-  "completeness": 0-100,
-  "classification": "bug|enhancement|question|invalid",
-  "severity": "critical|high|medium|low|none",
-  "priority": "critical|high|medium|low",
-  "recommendation": "close|needs-info|ready-for-review|already-addressed",
-  "close_reason": "spam|duplicate|question|test-issue|invalid|security",
-  "missing_info": ["List of missing required fields"],
-  "labels": ["bug", "area:core", "priority:medium"],
-  "assign_to": "maintainer-username",
+  "completeness": 50,
+  "classification": "bug",
+  "severity": "medium",
+  "priority": "medium",
+  "recommendation": "ready-for-review",
+  "close_reason": "security",
+  "missing_info": ["steps to reproduce"],
+  "labels": ["enhancement"],
+  "assign_to": "fewtarius",
   "root_cause": {
     "files": ["lib/Module/File.pm"],
     "functions": ["function_name"],
-    "hypothesis": "Detailed explanation of what is likely causing the issue and why",
-    "confidence": "high|medium|low"
+    "hypothesis": "Brief explanation of what is likely causing the issue and why",
+    "confidence": "medium"
   },
-  "affected_areas": ["List of other files or features that may be affected"],
+  "affected_areas": ["other affected files or features"],
   "summary": "Brief analysis for the comment - include root cause findings"
 }
 ```
+
+Replace the example values above with your actual analysis.
 
 **Notes:**
 - Set `assign_to` to a maintainer's GitHub username (any one of the project's active maintainers) for ANY issue that is NOT being closed. Pick a username from the project's maintainers list; do not invent one.

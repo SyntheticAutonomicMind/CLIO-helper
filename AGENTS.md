@@ -399,7 +399,11 @@ $self->{dbh}->do(q{
 | `github_token` | `$GH_TOKEN` | GitHub personal access token |
 | `model` | `minimax/MiniMax-M3` | AI model in provider/model format |
 | `route` | (empty) | Named routing profile from CLIO's `model_routes` config. Takes precedence over `model` when set. CLI `--route` overrides config. |
-| `clio_timeout` | 120 | Timeout in seconds for CLIO execution (prevents hangs on unresponsive models/routes) |
+| `clio_timeout` | 900 | Timeout in seconds for CLIO execution (prevents hangs on unresponsive models/routes) |
+| `fallback_timeout` | 1600 | Timeout for fallback model retry when route mode fails |
+| `min_repo_activity_days` | 180 | Skip repos with no pushes in the last N days (rate limit conservation) |
+| `repo_activity_cache_hours` | 24 | How long to cache repo-activity checks (avoids extra API calls per cycle) |
+| `clio_failure_retry_minutes` | 5 | Retry cooldown when CLIO returns skip due to timeout/parse error |
 | `dry_run` | false | Analyze without posting |
 | `maintainers` | `[]` | Usernames to skip |
 | `max_response_age_hours` | 24 | Don't respond to old discussions |

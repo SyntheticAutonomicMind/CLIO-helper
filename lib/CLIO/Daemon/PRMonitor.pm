@@ -86,6 +86,7 @@ sub new {
         analyzer  => undef,
         gh        => CLIO::Daemon::GH->new(debug => $args{debug} || 0),
         gh_token  => $args{config}{github_token} || $ENV{GH_TOKEN} || $ENV{GITHUB_TOKEN} || '',
+        _repo_activity_cache => {},
     };
     
     bless $self, $class;
@@ -123,7 +124,7 @@ sub _init_analyzer {
     $self->{analyzer} = CLIO::Daemon::Analyzer->new(
         model         => $self->{config}{model} || 'minimax/MiniMax-M3',
         route         => $self->{config}{route} || '',
-        timeout       => $self->{config}{clio_timeout} || 120,
+        timeout       => $self->{config}{clio_timeout} || 900,
         debug         => $self->{debug},
         clio_path     => $self->{config}{clio_path} || 'clio',
         repos_path    => $self->{config}{repos_dir} || '',
@@ -222,6 +223,11 @@ sub _poll_repo {
     
     $self->_log("DEBUG", "Polling PRs for $owner/$name");
     
+    # Skip inactive repos to conserve GitHub API rate limit budget
+    unless ($self->_is_repo_active($owner, $name)) {
+        return;
+    }
+    
     my $prs = $self->_fetch_prs($owner, $name);
     return unless $prs && @$prs;
     
@@ -304,12 +310,18 @@ sub _poll_repo {
                  : "new user activity") . ")");
         } else {
             # Never responded - apply check cooldown to avoid rapid rechecks
-            my $last_check = $self->{state}->get_last_check($pr_id);
+            my ($last_check, $last_action) = $self->{state}->get_last_check($pr_id);
             if ($last_check) {
                 my $age = time() - $last_check;
-                my $cooldown = ($self->{config}{pr_cooldown_minutes} || 30) * 60;
+                my $cooldown;
+                if ($last_action && ($last_action eq 'skip' || $last_action eq 'processing')) {
+                    # CLIO failure (timeout/parse error) - retry sooner
+                    $cooldown = ($self->{config}{clio_failure_retry_minutes} || 5) * 60;
+                } else {
+                    $cooldown = ($self->{config}{pr_cooldown_minutes} || 30) * 60;
+                }
                 if ($age < $cooldown) {
-                    $self->_log("DEBUG", "Skipping PR #$pr->{number} (in cooldown, ${age}s ago)");
+                    $self->_log("DEBUG", "Skipping PR #$pr->{number} (checked ${age}s ago, cooldown ${cooldown}s)");
                     next;
                 }
             }
@@ -373,7 +385,10 @@ sub _fetch_prs {
     my $s_limit = _safe_shell_arg($limit);
     my $cmd = qq{gh api "repos/$s_owner/$s_name/pulls?state=open&sort=updated&direction=desc&per_page=$s_limit" 2>/dev/null};
     my $response = `$cmd`;
-    return [] if $? != 0;
+    if ($? != 0) {
+        $self->_log("WARN", "Failed to fetch PRs for $owner/$name (rate limited or API error)");
+        return [];
+    }
     
     my $prs;
     eval { $prs = decode_json($response); };
@@ -1465,6 +1480,79 @@ sub _log {
     print STDERR "[$timestamp][$level][PRMonitor] $msg\n";
 }
 
+=head2 _is_repo_active
+
+Check if a repository has been active recently (at least one push within
+min_repo_activity_days). Results are cached in-memory for
+repo_activity_cache_hours (default 24) to avoid an extra API call
+per repo on every poll cycle.
+
+=cut
+
+sub _is_repo_active {
+    my ($self, $owner, $name) = @_;
+
+    my $min_days = $self->{config}{min_repo_activity_days} || 180;
+    my $cache_hours = $self->{config}{repo_activity_cache_hours} || 24;
+    my $cache_ttl = $cache_hours * 3600;
+
+    my $repo_key = "$owner/$name";
+    my $cached = $self->{_repo_activity_cache}{$repo_key};
+    if ($cached && (time() - $cached->{checked}) < $cache_ttl) {
+        return $cached->{active};
+    }
+
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name" --jq '.pushed_at' 2>/dev/null};
+    my $response = `$cmd`;
+
+    if ($? != 0) {
+        # Can't determine activity - assume active so we don't miss issues
+        $self->_log("DEBUG", "Could not check activity for $owner/$name, assuming active");
+        $self->{_repo_activity_cache}{$repo_key} = { checked => time(), active => 1 };
+        return 1;
+    }
+
+    chomp $response;
+    my $pushed_epoch = $self->_parse_iso8601($response);
+    if (!$pushed_epoch) {
+        $self->{_repo_activity_cache}{$repo_key} = { checked => time(), active => 1 };
+        return 1;
+    }
+
+    my $is_active = (time() - $pushed_epoch) < ($min_days * 86400);
+    $self->{_repo_activity_cache}{$repo_key} = { checked => time(), active => $is_active };
+
+    if (!$is_active) {
+        $self->_log("INFO", "Skipping $owner/$name (inactive for more than $min_days days)");
+    }
+
+    return $is_active;
+}
+
+=head2 _parse_iso8601
+
+Parse an ISO 8601 timestamp to Unix epoch. Returns 0 on parse failure.
+
+=cut
+
+sub _parse_iso8601 {
+    my ($self, $ts) = @_;
+
+    return 0 unless $ts;
+
+    if ($ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+        require Time::Local;
+        my ($y, $m, $d, $h, $min, $s) = ($1, $2, $3, $4, $5, $6);
+        return Time::Local::timegm($s, $min, $h, $d, $m - 1, $y - 1900);
+    }
+
+    return 0;
+}
+
 1;
 
 __END__
@@ -1579,6 +1667,79 @@ sub _log {
     
     my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
     print STDERR "[$timestamp][$level][PRMonitor] $msg\n";
+}
+
+=head2 _is_repo_active
+
+Check if a repository has been active recently (at least one push within
+min_repo_activity_days). Results are cached in-memory for
+repo_activity_cache_hours (default 24) to avoid an extra API call
+per repo on every poll cycle.
+
+=cut
+
+sub _is_repo_active {
+    my ($self, $owner, $name) = @_;
+
+    my $min_days = $self->{config}{min_repo_activity_days} || 180;
+    my $cache_hours = $self->{config}{repo_activity_cache_hours} || 24;
+    my $cache_ttl = $cache_hours * 3600;
+
+    my $repo_key = "$owner/$name";
+    my $cached = $self->{_repo_activity_cache}{$repo_key};
+    if ($cached && (time() - $cached->{checked}) < $cache_ttl) {
+        return $cached->{active};
+    }
+
+    local $ENV{GH_TOKEN} = $self->{gh_token} if $self->{gh_token};
+
+    my $s_owner = _safe_shell_arg($owner);
+    my $s_name  = _safe_shell_arg($name);
+    my $cmd = qq{gh api "repos/$s_owner/$s_name" --jq '.pushed_at' 2>/dev/null};
+    my $response = `$cmd`;
+
+    if ($? != 0) {
+        # Can't determine activity - assume active so we don't miss issues
+        $self->_log("DEBUG", "Could not check activity for $owner/$name, assuming active");
+        $self->{_repo_activity_cache}{$repo_key} = { checked => time(), active => 1 };
+        return 1;
+    }
+
+    chomp $response;
+    my $pushed_epoch = $self->_parse_iso8601($response);
+    if (!$pushed_epoch) {
+        $self->{_repo_activity_cache}{$repo_key} = { checked => time(), active => 1 };
+        return 1;
+    }
+
+    my $is_active = (time() - $pushed_epoch) < ($min_days * 86400);
+    $self->{_repo_activity_cache}{$repo_key} = { checked => time(), active => $is_active };
+
+    if (!$is_active) {
+        $self->_log("INFO", "Skipping $owner/$name (inactive for more than $min_days days)");
+    }
+
+    return $is_active;
+}
+
+=head2 _parse_iso8601
+
+Parse an ISO 8601 timestamp to Unix epoch. Returns 0 on parse failure.
+
+=cut
+
+sub _parse_iso8601 {
+    my ($self, $ts) = @_;
+
+    return 0 unless $ts;
+
+    if ($ts =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+        require Time::Local;
+        my ($y, $m, $d, $h, $min, $s) = ($1, $2, $3, $4, $5, $6);
+        return Time::Local::timegm($s, $min, $h, $d, $m - 1, $y - 1900);
+    }
+
+    return 0;
 }
 
 1;

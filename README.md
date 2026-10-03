@@ -295,7 +295,11 @@ Create `~/.clio/helper-config.json`:
     "model": "minimax/MiniMax-M3",
     "route": "",
     "clio_path": "clio",
-    "clio_timeout": 120,
+    "clio_timeout": 900,
+    "fallback_timeout": 1600,
+    "min_repo_activity_days": 180,
+    "repo_activity_cache_hours": 24,
+    "clio_failure_retry_minutes": 5,
     "dry_run": false,
     "maintainers": ["your-username"]
 }
@@ -315,7 +319,11 @@ See `examples/config.example.json` for a full configuration reference with all o
 | `model` | `minimax/MiniMax-M3` | AI model in provider/model format (any CLIO-supported model) |
 | `route` | (empty) | Named routing profile from CLIO's `model_routes` config. When set, takes precedence over `model`. Use this for fallback routing across multiple models. |
 | `clio_path` | `clio` | Path to CLIO executable |
-| `clio_timeout` | 120 | Timeout in seconds for CLIO execution (prevents hangs on unresponsive models/routes) |
+| `clio_timeout` | 900 | Timeout in seconds for CLIO execution (prevents hangs on unresponsive models/routes) |
+| `fallback_timeout` | 1600 | Timeout for fallback model retry when route mode fails |
+| `min_repo_activity_days` | 180 | Skip repos with no pushes in the last N days (rate limit conservation) |
+| `repo_activity_cache_hours` | 24 | How long to cache repo-activity checks (avoids extra API calls per cycle) |
+| `clio_failure_retry_minutes` | 5 | Retry cooldown when CLIO returns skip due to timeout/parse error |
 | `dry_run` | false | Analyze without posting responses |
 | `maintainers` | `[]` | GitHub usernames to skip (they handle their own threads) |
 

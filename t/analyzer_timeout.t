@@ -66,7 +66,7 @@ sub _read_args_log {
 
 {
     my $a = CLIO::Daemon::Analyzer->new();
-    is($a->{timeout}, 120, 'default timeout is 120 seconds');
+    is($a->{timeout}, 900, 'default timeout is 900 seconds');
 }
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ sub _read_args_log {
         route        => 'laguna-free',
         dry_run      => 0,
         clio_path    => 'clio',
-        clio_timeout => 120,
+        clio_timeout => 900,
     };
 
     my $mon_config = { route => '' };
@@ -207,7 +207,7 @@ sub _read_args_log {
 
     is($mon_config->{route},        'laguna-free', 'route propagated');
     is($mon_config->{clio_path},    'clio',        'clio_path propagated');
-    is($mon_config->{clio_timeout}, 120,           'clio_timeout propagated');
+    is($mon_config->{clio_timeout}, 900,           'clio_timeout propagated');
 }
 
 done_testing();

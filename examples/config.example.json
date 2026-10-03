@@ -24,7 +24,11 @@
     "model": "minimax/MiniMax-M3",
     "route": "",
     "clio_path": "clio",
-    "clio_timeout": 120,
+    "clio_timeout": 900,
+    "fallback_timeout": 1600,
+    "min_repo_activity_days": 180,
+    "repo_activity_cache_hours": 24,
+    "clio_failure_retry_minutes": 5,
     "dry_run": false,
     "maintainers": ["your-maintainer-username"],
 

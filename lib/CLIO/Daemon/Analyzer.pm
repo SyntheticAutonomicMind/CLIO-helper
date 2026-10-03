@@ -78,7 +78,8 @@ sub new {
     my $self = {
         model         => $args{model} || 'minimax/MiniMax-M3',
         route         => $args{route} || '',
-        timeout       => $args{timeout} || 120,
+        timeout       => $args{timeout} || 900,
+        fallback_timeout => $args{fallback_timeout} || 1600,
         debug         => $args{debug} || 0,
         clio_path     => $args{clio_path} || 'clio',
         repos_path    => $args{repos_path} || '',   # Path to cloned repos for context
@@ -116,20 +117,31 @@ Returns:
 sub analyze {
     my ($self, $context, $prompt_file) = @_;
     
-    # Use per-call prompt_file if provided, otherwise fall back to instance
     my $effective_prompt_file = $prompt_file || $self->{prompt_file};
-    
-    # Build the analysis prompt
     my $prompt = $self->_build_prompt($context, $effective_prompt_file);
-    
-    # Determine repo-specific path for code context
     my $repos_path = $context->{repos_path} || $self->{repos_path};
     
-    # Run CLIO to analyze
     my $response = $self->_run_clio($prompt, $repos_path);
-    
-    # Parse the response, passing context for metadata
     my $result = $self->_parse_response($response, $context);
+    
+    # Fallback: if route mode produced no valid result (skip or no
+    # action), retry with the direct model. Routing profiles (especially
+    # free-tier routes) can be unreliable and sometimes produce a partial
+    # response instead of a JSON block. The direct model is usually more
+    # consistent. Use a shorter timeout for the fallback to avoid double
+    # waiting when the route has already consumed most of the original timeout.
+    if ($self->{mode} eq 'route' && $self->{model} &&
+        (!$result->{action} || $result->{action} eq 'skip')) {
+        my $fallback_timeout = $self->{fallback_timeout} || 1600;
+        $self->_log("WARN", "Route produced no valid result, retrying with model: $self->{model} (timeout: ${fallback_timeout}s)");
+        $response = $self->_run_clio($prompt, $repos_path, $self->{model}, $fallback_timeout);
+        $result = $self->_parse_response($response, $context);
+        if ($result->{action} eq 'skip') {
+            $self->_log("WARN", "Fallback model also failed to produce valid JSON");
+        } else {
+            $self->_log("INFO", "Fallback model succeeded: $result->{action}");
+        }
+    }
     
     return $result;
 }
@@ -648,7 +660,7 @@ Execute CLIO with the analysis prompt.
 =cut
 
 sub _run_clio {
-    my ($self, $prompt, $repos_path) = @_;
+    my ($self, $prompt, $repos_path, $override_model, $timeout_override) = @_;
     
     # Write prompt to temp file to avoid shell escaping issues
     my ($fh, $temp_file) = tempfile(SUFFIX => '.md', UNLINK => 1);
@@ -660,7 +672,7 @@ sub _run_clio {
     my $clio = $self->{clio_path};
     my $model = $self->{model};
     $repos_path ||= $self->{repos_path};
-    my $timeout_sec = $self->{timeout} || 120;
+    my $timeout_sec = $timeout_override || $self->{timeout} || 120;
     
     # Debug: Log prompt info
     $self->_log("DEBUG", "Prompt length: " . length($prompt) . " chars");
@@ -668,7 +680,9 @@ sub _run_clio {
     $self->_log("DEBUG", "Temp file: $temp_file");
     $self->_log("DEBUG", "CLIO path: $clio");
     $self->_log("DEBUG", "Invocation mode: $self->{mode}");
-    if ($self->{mode} eq 'route') {
+    if ($override_model) {
+        $self->_log("DEBUG", "Override model: $override_model (bypassing route)");
+    } elsif ($self->{mode} eq 'route') {
         $self->_log("DEBUG", "Route: $self->{route}");
     } else {
         $self->_log("DEBUG", "Model: $model");
@@ -711,7 +725,9 @@ sub _run_clio {
     # exactly one. _safe_shell_arg keeps both values inside a conservative
     # allowlist so a misconfigured route name cannot inject arguments.
     my ($sel_flag, $sel_value);
-    if ($self->{mode} eq 'route') {
+    if ($override_model) {
+        ($sel_flag, $sel_value) = ('--model', $override_model);
+    } elsif ($self->{mode} eq 'route') {
         ($sel_flag, $sel_value) = ('--route', $self->{route});
     } else {
         ($sel_flag, $sel_value) = ('--model', $model);
@@ -724,7 +740,12 @@ sub _run_clio {
     # daemon indefinitely. GNU coreutils `timeout` sends SIGTERM after the
     # duration; `-k 10` follows up with SIGKILL if the process hasn't exited
     # within 10 additional seconds.
-    my $cmd = qq{${cd_prefix}timeout -k 10 $timeout_sec sh -c "cat '$temp_file' | $s_clio --new $sel_flag '$s_sel' --exit 2>&1"};
+    #
+    # We use `exec` inside sh -c so that timeout sends signals directly to
+    # the CLIO process, not just to the intermediate shell. Without `exec`,
+    # timeout kills sh -c but CLIO (a child of the pipeline) survives as an
+    # orphaned process. Input redirection (< file) replaces the cat| pipe.
+    my $cmd = qq{${cd_prefix}timeout -k 10 $timeout_sec sh -c "exec $s_clio --new $sel_flag '$s_sel' --exit < '$temp_file' 2>&1"};
     
     $self->_log("DEBUG", "Executing command: $cmd");
     
@@ -769,44 +790,60 @@ sub _parse_response {
     # Strip ANSI escape codes from response (CLIO may output colored text)
     $response =~ s/\x{1b}\[[0-9;]*[mK]//g;
     
-    # Try to extract JSON from response
+    # Try to extract JSON from response using multiple strategies.
+    # We prefer the LAST JSON match because CLIO's actual response
+    # appears after all tool/debug output, while the prompt template
+    # may be echoed in an earlier code fence.
+
     my $json_str;
-    
-    # Look for JSON block in markdown code fence
-    if ($response =~ /```json\s*(\{.*?\})\s*```/s) {
-        $json_str = $1;
-    }
-    
-    # Try balanced brace extraction for nested JSON
-    unless ($json_str) {
-        $json_str = $self->_extract_balanced_json($response);
-    }
-    
-    # Last resort: simple non-nested match
-    unless ($json_str) {
-        if ($response =~ /(\{[^{}]*"(?:action|classification|recommendation)"[^{}]*\})/s) {
-            $json_str = $1;
+    my $parsed;
+
+    # Strategy 1: Last JSON block in a markdown code fence
+    my @json_blocks = $response =~ /```json\s*(\{.*?\})\s*```/gs;
+    if (@json_blocks) {
+        $json_str = $json_blocks[-1];
+        $self->_log("DEBUG", "Found JSON in code fence (strategy 1)");
+        eval { $parsed = decode_json($json_str); };
+        if ($@) {
+            $self->_log("WARN", "Code fence JSON failed to parse: $@");
+            $json_str = undef;
         }
     }
-    
-    unless ($json_str) {
-        $self->_log("WARN", "Could not find JSON in CLIO response");
-        $self->_log("DEBUG", "Response was: " . substr($response, 0, 500));
+
+    # Strategy 2: Balanced brace extraction (handles nested JSON)
+    unless ($parsed) {
+        $json_str = $self->_extract_balanced_json($response);
+        if (defined $json_str) {
+            $self->_log("DEBUG", "Found JSON via balanced extraction (strategy 2)");
+            eval { $parsed = decode_json($json_str); };
+            if ($@) {
+                $self->_log("WARN", "Balanced JSON failed to parse: $@");
+                $json_str = undef;
+            }
+        }
+    }
+
+    # Strategy 3: Last resort - simple non-nested match
+    unless ($parsed) {
+        if ($response =~ /(\{[^{}]*"(?:action|classification|recommendation)"[^{}]*\})/s) {
+            $json_str = $1;
+            $self->_log("DEBUG", "Found JSON via simple match (strategy 3)");
+            eval { $parsed = decode_json($json_str); };
+            if ($@) {
+                $self->_log("WARN", "Simple match JSON failed to parse: $@");
+                $json_str = undef;
+            }
+        }
+    }
+
+    unless ($parsed) {
+        $self->_log("WARN", "Could not find valid JSON in CLIO response");
+        $self->_log("WARN", "Response was: " . substr($response, 0, 1000));
         return { action => 'skip', reason => 'Failed to parse response' };
     }
-    
+
     # Strip any remaining ANSI codes from extracted JSON
     $json_str =~ s/\x{1b}\[[0-9;]*[mK]//g;
-    
-    my $parsed;
-    eval {
-        $parsed = decode_json($json_str);
-    };
-    if ($@) {
-        $self->_log("WARN", "Failed to parse JSON: $@");
-        $self->_log("DEBUG", "JSON was: " . substr($json_str, 0, 500));
-        return { action => 'skip', reason => 'Invalid JSON in response' };
-    }
     
     # Detect response type and normalize to {action, message, reason} format
     my $result;
@@ -862,7 +899,7 @@ sub _parse_response {
 
 =head2 _extract_balanced_json
 
-Extract the largest balanced JSON object from a string.
+Extract the last valid balanced JSON object from a string.
 Handles nested objects and arrays (unlike simple regex).
 
 =cut
@@ -871,9 +908,12 @@ sub _extract_balanced_json {
     my ($self, $text) = @_;
     
     my $best_json;
-    my $best_len = 0;
     
-    # Find all opening braces and try to match balanced JSON
+    # Find all opening braces and try to match balanced JSON.
+    # We prefer the LAST valid match (not the longest) because CLIO's
+    # actual JSON response appears after the prompt template and any
+    # debug/tool output. The template may be valid but contain
+    # placeholder values that don't reflect a real analysis.
     while ($text =~ /\{/g) {
         my $start = pos($text) - 1;
         my $depth = 1;
@@ -904,12 +944,12 @@ sub _extract_balanced_json {
             my $candidate = substr($text, $start, $pos - $start);
             
             # Validate it's actual JSON with a key field we expect
-            if ($candidate =~ /"(?:action|classification|recommendation)"/ && length($candidate) > $best_len) {
+            if ($candidate =~ /"(?:action|classification|recommendation)"/) {
                 my $parsed;
                 eval { $parsed = decode_json($candidate); };
                 if (!$@ && ref($parsed) eq 'HASH') {
+                    # Always keep the last valid match (CLIO's actual response)
                     $best_json = $candidate;
-                    $best_len = length($candidate);
                 }
             }
         }

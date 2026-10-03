@@ -58,7 +58,10 @@ Create ~/.clio/helper-config.json:
         "model": "minimax/MiniMax-M3",
         "route": "",
         "clio_path": "clio",
-        "clio_timeout": 120,
+        "clio_timeout": 900,
+        "min_repo_activity_days": 180,
+        "repo_activity_cache_hours": 24,
+        "clio_failure_retry_minutes": 5,
         "dry_run": false,
         "maintainers": ["your-maintainer-username"]
     }
@@ -193,6 +196,9 @@ if ($enabled_monitors{discussions}) {
     $monitors{discussions}{config}{route}       = $config->{route}  if length $config->{route};
     $monitors{discussions}{config}{clio_path}   = $config->{clio_path};
     $monitors{discussions}{config}{clio_timeout} = $config->{clio_timeout};
+    $monitors{discussions}{config}{fallback_timeout} = $config->{fallback_timeout};
+    $monitors{discussions}{config}{min_repo_activity_days}     = $config->{min_repo_activity_days};
+    $monitors{discussions}{config}{repo_activity_cache_hours}   = $config->{repo_activity_cache_hours};
 }
 
 if ($enabled_monitors{issues}) {
@@ -289,7 +295,11 @@ sub _load_config {
     $config->{posting_token}            //= $ENV{CLIO_POSTING_TOKEN} || '';
     $config->{model}                    //= 'minimax/MiniMax-M3';
     $config->{route}                    //= '';
-    $config->{clio_timeout}             //= 120;
+    $config->{clio_timeout}             //= 900;
+    $config->{fallback_timeout}         //= 1600;
+    $config->{min_repo_activity_days}   //= 180;
+    $config->{repo_activity_cache_hours}  //= 24;
+    $config->{clio_failure_retry_minutes} //= 5;
     $config->{dry_run}                  //= 0;
     $config->{maintainers}              //= [];
     $config->{state_file}               //= "$ENV{HOME}/.clio/helper-state.db";
