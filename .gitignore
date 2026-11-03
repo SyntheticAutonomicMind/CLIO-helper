@@ -11,8 +11,14 @@ discuss-config.json
 # Handoff files (never commit)
 ai-assisted/
 
+# Local wrapper scripts (machine-specific; must not contain credentials)
+run-clio-helper
+
 # Scratch workspace
 scratch/
+
+# CLIO runtime session directories
+sessions/
 
 # Logs and temp
 *.log
