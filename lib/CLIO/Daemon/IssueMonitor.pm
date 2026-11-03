@@ -126,6 +126,7 @@ sub _init_analyzer {
         model         => $self->{config}{model} || 'minimax/MiniMax-M3',
         route         => $self->{config}{route} || '',
         timeout       => $self->{config}{clio_timeout} || 900,
+        fallback_timeout => $self->{config}{fallback_timeout} || 1600,
         debug         => $self->{debug},
         clio_path     => $self->{config}{clio_path} || 'clio',
         repos_path    => $self->{config}{repos_dir} || '',
