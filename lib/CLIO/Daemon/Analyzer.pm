@@ -745,7 +745,16 @@ sub _run_clio {
     # the CLIO process, not just to the intermediate shell. Without `exec`,
     # timeout kills sh -c but CLIO (a child of the pipeline) survives as an
     # orphaned process. Input redirection (< file) replaces the cat| pipe.
-    my $cmd = qq{${cd_prefix}timeout -k 10 $timeout_sec sh -c "exec $s_clio --new $sel_flag '$s_sel' --exit < '$temp_file' 2>&1"};
+    # Hard-disable subagents and remote execution for all daemon invocations.
+    # The daemon needs CLIO to return a JSON action payload, but interactive
+    # behaviors leak through from the user's own CLIO config (e.g. subagents
+    # being enabled) and cause CLIO to produce agent-style narrative output
+    # ("I'll start by reading...") instead of the JSON the Analyzer expects.
+    # Disabling these tools at the CLI level makes the daemon immune to
+    # changes in the user's CLIO configuration. remote_execution is also
+    # disabled so the bot can never spawn CLIO instances on other machines.
+    my $s_disabled_tools = _safe_shell_arg('agent_operations,remote_execution');
+    my $cmd = qq{${cd_prefix}timeout -k 10 $timeout_sec sh -c "exec $s_clio --new $sel_flag '$s_sel' --disable $s_disabled_tools --exit < '$temp_file' 2>&1"};
     
     $self->_log("DEBUG", "Executing command: $cmd");
     
